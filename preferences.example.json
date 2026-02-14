@@ -1,0 +1,14 @@
+{
+  "likes": [
+    {
+      "weight": 2.5,
+      "keywords": ["trapped ion", "quantum error correction", "entanglement"],
+      "authors": ["Rainer Blatt", "Christopher Monroe"]
+    },
+    {
+      "weight": 1.5,
+      "keywords": ["llm", "scientific discovery", "materials"],
+      "authors": ["Yoshua Bengio"]
+    }
+  ]
+}
