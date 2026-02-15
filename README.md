@@ -151,12 +151,3 @@ python -m src.lit_digest \
 - 自动把识别到的关键词/作者合并进现有偏好，不会覆盖你手工写的原有偏好。
 - 你也可以用 `--build-preferences-from-zotero` 先生成新文件，再人工审核后替换。
 
-python -m src.lit_digest
-```
-
-## 下一步建议
-
-- 用定时任务（crontab / GitHub Actions）每天跑一次。
-- 增加向量召回（embedding）替换当前关键词匹配。
-- 增加“已读反馈”回流，动态更新偏好画像。
-- 加入 LLM 自动摘要与对比总结（按分类生成 weekly report）。
