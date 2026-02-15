@@ -18,6 +18,7 @@ from src.lit_digest import (
     load_subscription_config,
     text_to_embedding,
 )
+from src.lit_digest import Paper, PreferenceProfile, PaperStore, detect_category
 
 
 class LitDigestTests(unittest.TestCase):
@@ -44,6 +45,34 @@ class LitDigestTests(unittest.TestCase):
         self.assertGreater(cosine_similarity(v1, v2), cosine_similarity(v1, v3))
 
     def test_store_upsert_query_status_and_tag(self):
+        profile = PreferenceProfile(
+            keywords={"trapped ion": 2.0, "entanglement": 1.0},
+            authors={"alice smith": 2.0},
+        )
+        paper = Paper(
+            source="arxiv",
+            source_id="1",
+            title="Trapped ion entanglement benchmark",
+            summary="We demonstrate fidelity improvement.",
+            authors=["Alice Smith"],
+            link="http://example.com",
+            published_at="2026-01-01",
+        )
+        self.assertGreater(profile.score(paper), 5.0)
+
+    def test_detect_category_quantum(self):
+        paper = Paper(
+            source="nature",
+            source_id="2",
+            title="A qubit control method",
+            summary="entanglement and trapped ion hardware",
+            authors=[],
+            link="",
+            published_at="",
+        )
+        self.assertEqual(detect_category(paper), "quantum")
+
+    def test_store_upsert_and_query(self):
         with tempfile.TemporaryDirectory() as td:
             db = str(Path(td) / "papers.db")
             store = PaperStore(db)
@@ -108,6 +137,11 @@ class LitDigestTests(unittest.TestCase):
             self.assertIn("likes", data)
             self.assertGreaterEqual(len(data["likes"]), 1)
             self.assertIn("Rainer Blatt", data["likes"][0]["authors"])
+            store.upsert(paper, "other", 3.1)
+            rows = store.top_papers(1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][1], "title")
+            json.loads(rows[0][2])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,22 @@
 - **标签筛选阅读**：页面可按标签 + 已读状态过滤。
 
 ## 安装
+一个用于**订阅 + 初筛 + 分类 + 存储 + Zotero 集成预留**的科研文献流水线（MVP）。
+
+## 功能概览
+
+- 订阅来源：
+  - arXiv（默认查询 `all:quantum`）
+  - Nature RSS
+  - Science RSS
+  - PRL RSS
+- 根据历史偏好（关键词、作者、权重）计算相关度分数。
+- 自动分类（quantum / ml-ai / materials / bio / astro / other）。
+- 结果写入 SQLite（`papers.db`），并生成 `digest.md` 推送稿。
+- 支持定期“重梳理/重分类”（recluster）。
+- 支持将高分论文自动同步到 Zotero（通过 Zotero Web API）。
+
+## 快速开始
 
 ```bash
 python -m venv .venv
@@ -56,6 +72,45 @@ KEEP_DAYS=7 ./scripts/run_local_update.sh
 - 一键生成周报
 
 ## Zotero 导出配置
+python -m src.lit_digest
+```
+
+运行后会得到：
+
+- `papers.db`：文献结构化存储
+- `digest.md`：可直接发到飞书/邮件/Notion 的摘要稿
+
+## 偏好配置
+
+编辑 `preferences.json`：
+
+```json
+{
+  "likes": [
+    {
+      "weight": 2.5,
+      "keywords": ["trapped ion", "quantum error correction"],
+      "authors": ["Rainer Blatt"]
+    }
+  ]
+}
+```
+
+- `weight`：你对这组偏好的重视程度。
+- `keywords`：会在 title/summary 中匹配。
+- `authors`：作者命中时额外加权。
+
+## 重分类（定期梳理）
+
+```bash
+python -m src.lit_digest --recluster --db papers.db
+```
+
+适合每周/每月在分类规则调整后批量刷新。
+
+## Zotero 集成
+
+配置环境变量后，pipeline 会把 Top-N 高分文章同步到 Zotero：
 
 ```bash
 export ZOTERO_API_KEY=xxxx
@@ -77,4 +132,6 @@ python -m src.lit_digest --mark-unread "arxiv||http://arxiv.org/abs/xxxx"
 
 # 生成周报
 python -m src.lit_digest --weekly-report --db papers.db --report-output weekly_report.md --report-days 7
+```
+python -m src.lit_digest
 ```
