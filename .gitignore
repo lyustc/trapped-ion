@@ -1,0 +1,12 @@
+﻿__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.history/
+*.db
+tmp_home.html
+preferences.json
+subscriptions.json
+zotero-export.json
+digest.md
+weekly_report.md
