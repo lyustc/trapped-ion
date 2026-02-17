@@ -1,105 +1,153 @@
-# 文献摘要与推荐工具 — 完整说明
+﻿# 文献跟踪与推荐工具（Trapped-Ion 优化版）
 
-这是一个本地运行的科研文献跟踪与推荐工具，面向量子与相关物理方向。工具从 arXiv 与若干 RSS 源抓取条目，结合用户偏好打分并在网页界面上展示，支持交互式标记与偏好更新。
+这是一个本地运行的科研文献聚合与筛选工具，当前默认针对 **Quantum Trapped-Ion** 方向做了规则和来源优化。
 
-## 主要功能
+工具会从 arXiv + 多个期刊 RSS 抓取条目，进行分类、打分、过滤，并通过 Web 页面进行浏览与交互。
 
-- 数据源：自动抓取 arXiv（默认量子/atomic-physics 查询）与 RSS（如 Nature / Science / PRL）。
-- 分类与过滤：基于规则与短语触发器进行类别检测，区分 `trapped-ion` 与 `quantum-platform` 等量子相关类别；非量子噪声默认归入 `other`。
-- 偏好驱动推荐：从 `preferences.json` 加载关键词与作者偏好，按偏好打分并排序展示。
-- Zotero 支持：通过上传 Zotero 导出的 JSON 生成/合并偏好（作者名标准化与去重）。
-- Web 仪表盘：启动 Flask 服务器在浏览器查看结果，支持折叠类目、按点击标记为已读、显示发表时间、调整 `arxiv_max_results` 与 `keep_days`。
-- 数据库维护：`recluster_existing()` 重新分类现有记录，`clean_database()` 清理非量子噪声并保留高影响期刊与物理相关条目。
-- 同步：可选择将推荐条目同步回 Zotero（`sync_to_zotero`）。
+## 1. 主要功能
 
-## 快速开始
+- 多源抓取：
+  - arXiv（可配置 query 与最大条数）
+  - RSS（Nature / Science / APS 等）
+- 自动分类：
+  - 重点分类 `trapped-ion`、`quantum-*`、`other`
+  - 分类顺序固定，`other` 永远在最后
+- 近期期刊优先：
+  - 列表排序会优先已发表来源（非 arXiv）
+- 交互式看板：
+  - 按分类折叠/展开
+  - 过滤已读/未读、标签、是否显示 arXiv
+  - 一键更新与重抓
+- 阅读与导出：
+  - 点击论文自动标记已读
+  - 支持勾选后导出到 Zotero
+- 偏好支持：
+  - 通过 `preferences.json` 维护关键词/作者偏好用于打分
 
-1. 创建并激活虚拟环境（推荐）
+## 2. 快速开始
+
+### 2.1 环境准备
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
-```
-
-2. 安装依赖
-
-```powershell
 pip install -r requirements.txt
 ```
 
-3. 配置（可选）
+### 2.2 配置文件
 
-- 复制 `preferences.example.json` 为 `preferences.json` 并根据需要修改关键词/作者权重。
-- 如果需要自定义 arXiv 查询或 RSS 源，复制 `subscriptions.example.json` 并编辑 `arxiv_query` / `arxiv_max_results` / `rss_feeds`。
+- 订阅配置：`subscriptions.json`
+  - `arxiv_query`
+  - `arxiv_max_results`
+  - `rss_feeds`
+- 偏好配置：`preferences.json`
 
-## 运行与常用命令
+如果没有可先参考：
+- `subscriptions.example.json`
+- `preferences.example.json`
 
-- 运行推荐管线并生成本地 `digest.md`：
-
-```powershell
-python -m src.lit_digest --db papers.db --keep-days 3
-```
-
-- 仅重分类现有数据库（不抓取）：
-
-```powershell
-python -m src.lit_digest --recluster --db papers.db
-```
-
-- 清理数据库（移除非量子噪声）：
-
-```powershell
-python -c "from src.lit_digest import clean_database; print(clean_database('papers.db', keep_days=3))"
-```
-
-- 启动网页仪表盘：
+### 2.3 启动看板
 
 ```powershell
 python src/web_app.py
 ```
 
-在浏览器打开 http://127.0.0.1:8787
+浏览器打开：
 
-## 网页界面功能
+```text
+http://127.0.0.1:8787
+```
 
-- 顶部工具条：可以设置 `keep_days`（保留的近期天数）与 `arxiv_max_results`（arXiv 拉取上限）。
-- 列表展示：显示论文标题、作者、发表时间、类别与匹配分数。
-- 折叠类目卡片：每个类别可以折叠与展开，折叠状态保存在 `localStorage`。
-- 点击外部链接时自动 POST 到 `/mark-read-click`，将对应论文标记为已读。
+## 3. 常用命令
 
-## 分类规则与策略
+### 3.1 命令行跑一次抓取/更新
 
-- 采用显式触发词（如 `trapped ion` / `ion trap`）优先判定 `trapped-ion` 类别，使用词边界匹配避免子串误判。
-- 其它物理系统（例如超导原件、量子点、原子等）聚合到 `quantum-platform` 类别。
-- 只保留与量子显著相关的条目。
+```powershell
+python -m src.lit_digest --db papers.db --subscriptions subscriptions.json --keep-days 7
+```
 
-## 数据库与 API（开发者）
+### 3.2 仅重分类已有数据
 
-- `src/lit_digest.py`:
-  - `run_pipeline(...)`: 抓取 arXiv/RSS、检测类别、打分并写入 `papers.db`。
-  - `recluster_existing(db_path)`: 重新对 `papers` 表中条目分类并更新 `tags`/`article_type`。
-  - `clean_database(db_path, keep_days)`: 重新分类并删除非量子/非物理且非允许期刊的条目。
-  - `build_preferences_from_zotero(...)` / `update_preferences_from_zotero(...)`: 从 Zotero 导出构建或合并偏好。
-  - `sync_to_zotero(rows)`: 将推荐条目批量推送回 Zotero（需要环境变量 `ZOTERO_API_KEY` / `ZOTERO_USER_ID`）。
-- `src/web_app.py`:
-  - Flask 应用负责渲染仪表盘、处理 `/mark-read-click`（标记已读）等交互。
+```powershell
+python -m src.lit_digest --recluster --db papers.db
+```
 
-## 测试与维护
+### 3.3 生成周报
 
-- 单元测试：运行 `pytest`（项目包含 `tests/test_lit_digest.py`）。
+```powershell
+python -m src.lit_digest --weekly-report --db papers.db --report-days 7
+```
+
+### 3.4 运行测试
 
 ```powershell
 pytest -q
 ```
 
-- 若出现分类误判，可编辑 `src/lit_digest.py` 中的触发词列表 `TRAPPED_ION_TRIGGERS` / `QUANTUM_PLATFORM_TRIGGERS` 或 `CATEGORY_RULES`，并运行 `--recluster` 与 `clean_database`。
+## 4. 当前针对 Trapped-Ion 的优化点
 
-## 开发者备注
+当前代码中对 trapped-ion 方向做了定向优化，主要在：
 
-- 数据库文件：`papers.db`（SQLite）存储论文条目与 `feedback`。
-- 偏好历史：`preferences.json` 用于保存用户偏好。
-- 默认抓取策略：arXiv 默认按 `submittedDate` 降序抓取，`arxiv_max_results` 默认为配置文件中的值（网页上可调整）。
+- 触发词与分类规则（`src/lit_digest.py`）
+  - `TRAPPED_ION_TRIGGERS`
+  - `QUANTUM_TRIGGERS`
+  - `CATEGORY_RULES`
+- “other” 过滤策略（优先保留量子相关）
+- 期刊源选择与保留逻辑
+- 页面展示顺序（固定分类顺序，`other` 在最后）
+
+## 5. 如果改为其它研究方向，如何调整
+
+假设你要改成例如 `superconducting qubit`、`quantum networking`、`materials` 等方向，建议按下面顺序改：
+
+### 5.1 改数据源
+
+编辑 `subscriptions.json`：
+
+- 修改 `arxiv_query` 为目标领域关键词
+- 增删 `rss_feeds`（保留高相关来源，去掉噪声来源）
+
+### 5.2 改分类规则
+
+编辑 `src/lit_digest.py`：
+
+- 替换/新增 `CATEGORY_RULES` 的类别和关键词
+- 替换 `TRAPPED_ION_TRIGGERS` 为新方向触发词
+- 视需求调整 `QUANTUM_TRIGGERS`（或领域通用触发词）
+
+### 5.3 改过滤与保留策略
+
+仍在 `src/lit_digest.py`：
+
+- 调整 `allowed_other_journals`
+- 调整 `run_pipeline()` 里 `other` 的保留逻辑
+- 如需更严格，增加“必须包含某些关键词”条件
+
+### 5.4 改前端展示顺序
+
+编辑 `src/web_app.py`：
+
+- 修改 `DISPLAY_CATEGORY_ORDER`，使新分类顺序符合你的阅读习惯
+
+### 5.5 重建已有库（可选）
+
+如果已有 `papers.db` 是旧规则生成，改规则后建议执行：
+
+```powershell
+python -m src.lit_digest --recluster --db papers.db
+```
+
+必要时可先备份旧库，再重新抓取。
+
+## 6. 目录说明
+
+- `src/lit_digest.py`：抓取、分类、打分、入库、报告
+- `src/web_app.py`：Flask 看板与交互
+- `papers.db`：SQLite 数据库
+- `subscriptions.json`：数据源配置
+- `preferences.json`：偏好配置
+- `tests/`：测试
 
 ---
 
-Generated on 2026-02-16
+如需把项目从 trapped-ion 完整迁移到新方向，我可以按你的目标领域直接给出一版可用的 `subscriptions.json + CATEGORY_RULES` 修改稿。

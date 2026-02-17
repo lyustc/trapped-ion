@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,14 @@ DEFAULT_RSS_FEEDS = {
     "nature": "https://www.nature.com/nature.rss",
     "science": "https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science",
     "prl": "https://journals.aps.org/rss/recent/prl.xml",
+}
+
+# Fallback when APS RSS endpoints are blocked by anti-bot pages.
+APS_CROSSREF_ISSN = {
+    "prl": "0031-9007",
+    "prx": "2160-3308",
+    "prx-quantum": "2691-3399",
+    "pr-applied": "2331-7019",
 }
 
 CATEGORY_RULES = {
@@ -198,7 +207,14 @@ class PaperStore:
             conn.execute("DELETE FROM feedback WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.source=feedback.source AND p.source_id=feedback.source_id)")
             return cur.rowcount
 
-    def top_papers(self, limit: int = 200, status: str = "all", tag: str = "") -> list[tuple]:
+    def top_papers(
+        self,
+        limit: int = 200,
+        status: str = "all",
+        tag: str = "",
+        include_arxiv: bool = True,
+        sort_by: str = "score",
+    ) -> list[tuple]:
         clauses = []
         params: list = []
         if status in {"read", "unread"}:
@@ -207,13 +223,37 @@ class PaperStore:
         if tag:
             clauses.append("tags LIKE ?")
             params.append(f'%"{tag}"%')
+        if not include_arxiv:
+            clauses.append("source <> ?")
+            params.append("arxiv")
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        # Order: quantum categories first, then `quantum-others`, then `other` last
+        if sort_by not in {"score", "time"}:
+            sort_by = "score"
+
+        # Prefer published (non-arXiv) items over preprints.
+        if sort_by == "time":
+            order_sql = """
+                (CASE WHEN source='arxiv' THEN 1 ELSE 0 END) ASC,
+                (CASE WHEN category='other' THEN 2 WHEN category='quantum-others' THEN 1 ELSE 0 END) ASC,
+                category ASC,
+                published_at DESC,
+                score DESC
+            """
+        else:
+            order_sql = """
+                (CASE WHEN source='arxiv' THEN 1 ELSE 0 END) ASC,
+                (CASE WHEN category='other' THEN 2 WHEN category='quantum-others' THEN 1 ELSE 0 END) ASC,
+                category ASC,
+                score DESC,
+                published_at DESC
+            """
+
         sql = f"""
             SELECT source, source_id, title, summary, authors, link, published_at, category, score, tags, article_type, read_status
             FROM papers
             {where_sql}
-            ORDER BY (CASE WHEN category='other' THEN 2 WHEN category='quantum-others' THEN 1 ELSE 0 END) ASC, category ASC, score DESC, published_at DESC
+            ORDER BY
+                {order_sql}
             LIMIT ?
         """
         params.append(limit)
@@ -441,11 +481,40 @@ def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Pape
     import requests
     import feedparser
 
-    # request recent submissions first
-    params = {"search_query": query, "start": 0, "max_results": max_results, "sortBy": "submittedDate", "sortOrder": "descending"}
-    res = requests.get(ARXIV_API, params=params, timeout=30)
-    res.raise_for_status()
-    feed = feedparser.parse(res.text)
+    # request recent submissions first; be resilient to arXiv rate limiting (HTTP 429)
+    headers = {
+        "User-Agent": os.getenv("ARXIV_USER_AGENT", "lit-digest/1.0 (contact: local-user)")
+    }
+    req_max = max(1, int(max_results))
+    last_exc: Exception | None = None
+    res_text = ""
+    for attempt in range(4):
+        params = {
+            "search_query": query,
+            "start": 0,
+            "max_results": req_max,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        try:
+            res = requests.get(ARXIV_API, params=params, headers=headers, timeout=30)
+            if res.status_code == 429:
+                # back off and reduce load aggressively
+                time.sleep(min(8, 1.5 * (attempt + 1)))
+                req_max = max(25, req_max // 2)
+                continue
+            res.raise_for_status()
+            res_text = res.text
+            break
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(min(6, 1.0 * (attempt + 1)))
+            req_max = max(25, req_max // 2)
+    if not res_text:
+        # Don't crash pipeline if arXiv is temporarily unavailable.
+        return []
+
+    feed = feedparser.parse(res_text)
     papers = []
     for entry in feed.entries:
         papers.append(
@@ -462,14 +531,85 @@ def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Pape
     return papers
 
 
-def fetch_rss_feeds(feeds: dict[str, str] | None = None) -> list[Paper]:
+def _parse_crossref_date(item: dict) -> str:
+    for key in ("published-online", "published-print", "published", "issued", "created"):
+        node = item.get(key) or {}
+        parts = node.get("date-parts") or []
+        if not parts or not parts[0]:
+            continue
+        vals = parts[0]
+        y = int(vals[0])
+        m = int(vals[1]) if len(vals) > 1 else 1
+        d = int(vals[2]) if len(vals) > 2 else 1
+        return datetime(y, m, d, tzinfo=timezone.utc).isoformat()
+    return ""
+
+
+def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
+    import requests
+
+    issn = APS_CROSSREF_ISSN.get(source)
+    if not issn:
+        return []
+
+    from_date = (datetime.now(timezone.utc) - timedelta(days=keep_days + 1)).date().isoformat()
+    url = f"https://api.crossref.org/journals/{issn}/works"
+    params = {
+        "filter": f"from-pub-date:{from_date}",
+        "sort": "published",
+        "order": "desc",
+        "rows": 100,
+    }
+    try:
+        res = requests.get(url, params=params, timeout=30)
+        res.raise_for_status()
+        payload = res.json()
+    except Exception:
+        return []
+
+    papers: list[Paper] = []
+    for item in (payload.get("message") or {}).get("items", []):
+        title_list = item.get("title") or []
+        title = clean_text(title_list[0] if title_list else "")
+        if not title:
+            continue
+        abstract = re.sub(r"<[^>]+>", " ", item.get("abstract") or "")
+        authors = []
+        for a in item.get("author") or []:
+            given = (a.get("given") or "").strip()
+            family = (a.get("family") or "").strip()
+            name = f"{given} {family}".strip() or (a.get("name") or "").strip()
+            if name:
+                authors.append(name)
+        doi = (item.get("DOI") or "").strip()
+        link = f"https://doi.org/{doi}" if doi else (item.get("URL") or "")
+        source_id = doi or link or title
+        papers.append(
+            Paper(
+                source=source,
+                source_id=source_id,
+                title=title,
+                summary=clean_text(abstract),
+                authors=authors,
+                link=link,
+                published_at=_parse_crossref_date(item),
+            )
+        )
+    return papers
+
+
+def fetch_rss_feeds(feeds: dict[str, str] | None = None, keep_days: int = 7) -> list[Paper]:
     import feedparser
 
     feeds = feeds or DEFAULT_RSS_FEEDS
     papers: list[Paper] = []
     for source, url in feeds.items():
         feed = feedparser.parse(url)
-        for entry in feed.entries:
+        entries = list(getattr(feed, "entries", []) or [])
+        if not entries and source in APS_CROSSREF_ISSN:
+            papers.extend(_fetch_aps_via_crossref(source=source, keep_days=keep_days))
+            continue
+        for entry in entries:
             authors = []
             if "authors" in entry:
                 authors = [a.get("name", "") for a in entry.authors]
@@ -1014,7 +1154,18 @@ def clean_database(db_path: str = "papers.db", keep_days: int = 3) -> dict:
     Returns a dict with counts: {'reclustered': N, 'deleted': M}
     """
     # Narrow set of high-tier journals allowed for `other` (exclude Nature Communications and arXiv)
-    allowed_other_journals = ('nature', 'nature physics', 'nature-physics', 'science', 'prl', 'prx')
+    allowed_other_journals = (
+        'nature',
+        'nature physics',
+        'nature-physics',
+        'nature photonics',
+        'nature-photonics',
+        'science',
+        'science advances',
+        'science-advances',
+        'prl',
+        'prx',
+    )
     quantum_categories = {k for k in CATEGORY_RULES.keys() if ('quantum' in k) or (k in ('trapped-ion', 'quantum-platform', 'quantum-others'))}
     # treat these broader categories as 'other' unless the text contains quantum signals
     force_to_other = {'materials', 'ml-ai'}
@@ -1098,11 +1249,22 @@ def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.
     store = PaperStore(db_path)
     arxiv_query, cfg_arxiv_max_results, feeds = load_subscription_config(subscriptions_path)
     use_max = cfg_arxiv_max_results if arxiv_max_results is None else int(arxiv_max_results)
-    papers = fetch_arxiv(query=arxiv_query, max_results=use_max) + fetch_rss_feeds(feeds=feeds)
+    papers = fetch_arxiv(query=arxiv_query, max_results=use_max) + fetch_rss_feeds(feeds=feeds, keep_days=keep_days)
     # Define which detected categories are considered "quantum" (keep them distinct)
     quantum_categories = {k for k in CATEGORY_RULES.keys() if ('quantum' in k) or (k in ('trapped-ion', 'quantum-platform'))}
     # Allowed journal sources for 'other' category (exclude arXiv and Nature Communications)
-    allowed_other_journals = ('nature', 'nature physics', 'science', 'prl', 'prx')
+    allowed_other_journals = (
+        'nature',
+        'nature physics',
+        'nature-physics',
+        'nature photonics',
+        'nature-photonics',
+        'science',
+        'science advances',
+        'science-advances',
+        'prl',
+        'prx',
+    )
     for paper in papers:
         # detect category and treat non-quantum categories as 'other'
         category = detect_category(paper)
