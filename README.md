@@ -19,10 +19,11 @@
   - 过滤已读/未读、标签、是否显示 arXiv
   - 一键更新与重抓
 - 阅读与导出：
-  - 点击论文自动标记已读
-  - 支持勾选后导出到 Zotero
+  - 点击论文自动标记已读，刷新网页后更新
+  - 支持勾选后导出为 BibTeX 文件（`.bib`），再导入 Zotero
 - 偏好支持：
   - 通过 `preferences.json` 维护关键词/作者偏好用于打分
+  - 支持导入 Zotero 导出的 JSON，并自动更新 `preferences.json`
 
 ## 2. 快速开始
 
@@ -58,6 +59,16 @@ python src/web_app.py
 http://127.0.0.1:8787
 ```
 
+### 2.4 Zotero JSON 导入并自动更新 preferences
+
+在看板页面的“从 Zotero 导入并更新偏好”模块中：
+
+1. 上传 Zotero 导出的 JSON 文件  
+2. 勾选“合并到当前偏好（自动更新 preferences）”  
+3. 提交后会自动把抽取到的作者/关键词合并到 `preferences.json`
+
+如果不勾选 merge，会生成预览文件（默认 `preferences.merged.json`）供你先审阅。
+
 ## 3. 常用命令
 
 ### 3.1 命令行跑一次抓取/更新
@@ -83,6 +94,11 @@ python -m src.lit_digest --weekly-report --db papers.db --report-days 7
 ```powershell
 pytest -q
 ```
+
+### 3.5 导出选中文献为 BibTeX
+
+在 Web 页面勾选条目后点击“导出勾选为 BibTeX (.bib)”，浏览器会下载 `.bib` 文件。  
+你可以在 Zotero 中使用 `File -> Import` 导入该文件。
 
 ## 4. 当前针对 Trapped-Ion 的优化点
 
@@ -129,15 +145,6 @@ pytest -q
 
 - 修改 `DISPLAY_CATEGORY_ORDER`，使新分类顺序符合你的阅读习惯
 
-### 5.5 重建已有库（可选）
-
-如果已有 `papers.db` 是旧规则生成，改规则后建议执行：
-
-```powershell
-python -m src.lit_digest --recluster --db papers.db
-```
-
-必要时可先备份旧库，再重新抓取。
 
 ## 6. 目录说明
 
@@ -150,4 +157,3 @@ python -m src.lit_digest --recluster --db papers.db
 
 ---
 
-如需把项目从 trapped-ion 完整迁移到新方向，我可以按你的目标领域直接给出一版可用的 `subscriptions.json + CATEGORY_RULES` 修改稿。

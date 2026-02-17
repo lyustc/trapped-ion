@@ -6,7 +6,7 @@ import sqlite3
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone
 
-from src.lit_digest import PaperStore, generate_weekly_report, run_pipeline, sync_to_zotero, load_subscription_config
+from src.lit_digest import PaperStore, generate_weekly_report, run_pipeline, load_subscription_config
 
 DISPLAY_CATEGORY_ORDER = [
     "trapped-ion",
@@ -109,7 +109,7 @@ PAGE = """
     <form method="post" action="/zotero-upload" enctype="multipart/form-data">
       <label>上传 Zotero 导出文件 (JSON)</label>
       <input type="file" name="zotero_file" accept="application/json" />
-      <label>合并到当前偏好</label>
+      <label>合并到当前偏好（自动更新 preferences）</label>
       <input type="checkbox" name="merge" />
       <button type="submit">处理 Zotero 导出</button>
     </form>
@@ -146,7 +146,7 @@ PAGE = """
       <button type="submit">保存勾选</button>
       <button class="secondary" formaction="/mark-read" type="submit">标记为已读</button>
       <button class="secondary" formaction="/mark-unread" type="submit">标记为未读</button>
-      <button formaction="/export-selected" type="submit">导出勾选到 Zotero</button>
+      <button formaction="/export-selected" type="submit">导出勾选为 BibTeX (.bib)</button>
       <button class="secondary" formaction="/weekly-report" type="submit">生成周报</button>
     </div>
 
@@ -198,9 +198,64 @@ def parse_paper_ids(values: list[str]) -> list[tuple[str, str]]:
     return pairs
 
 
+def _compact_authors(authors: list[str], head: int = 3, tail: int = 2, full_limit: int = 10) -> str:
+    clean = [a.strip() for a in (authors or []) if str(a).strip()]
+    n = len(clean)
+    if n == 0:
+        return ""
+    if n <= full_limit:
+        return ", ".join(clean)
+    return ", ".join(clean[:head]) + " ... " + ", ".join(clean[-tail:])
+
+
+def _bibtex_escape(text: str) -> str:
+    if not text:
+        return ""
+    return str(text).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+def _rows_to_bibtex(rows: list[tuple]) -> str:
+    entries: list[str] = []
+    for idx, r in enumerate(rows, start=1):
+        source, source_id, title, summary, authors_json, link, published, category, score = r[:9]
+        try:
+            authors = json.loads(authors_json or "[]")
+            if not isinstance(authors, list):
+                authors = [str(authors)]
+        except Exception:
+            authors = [str(authors_json)] if authors_json else []
+        author_field = " and ".join(_bibtex_escape(a) for a in authors if a) or "Unknown"
+        year = ""
+        if published:
+            y = str(published)[:4]
+            year = y if y.isdigit() else ""
+        key = f"{(source or 'paper').replace(' ', '-')}-{idx}"
+        journal = _bibtex_escape(source or "unknown")
+        doi = ""
+        if link and "doi.org/" in link:
+            doi = link.split("doi.org/", 1)[1].strip()
+        fields = [
+            f"  title = {{{_bibtex_escape(title)}}}",
+            f"  author = {{{author_field}}}",
+            f"  journal = {{{journal}}}",
+            f"  url = {{{_bibtex_escape(link or '')}}}",
+            f"  note = {{{_bibtex_escape('category=' + str(category) + ', score=' + str(score))}}}",
+        ]
+        if year:
+            fields.append(f"  year = {{{year}}}")
+        if doi:
+            fields.append(f"  doi = {{{_bibtex_escape(doi)}}}")
+        if summary:
+            fields.append(f"  abstract = {{{_bibtex_escape(summary)}}}")
+        fields.append(f"  annote = {{{_bibtex_escape('source_id=' + str(source_id))}}}")
+        entry = "@article{" + key + ",\n" + ",\n".join(fields) + "\n}\n"
+        entries.append(entry)
+    return "\n".join(entries)
+
+
 def create_app():
     try:
-        from flask import Flask, redirect, render_template_string, request, url_for
+        from flask import Flask, Response, redirect, render_template_string, request, url_for
     except ModuleNotFoundError as exc:
         raise RuntimeError("Flask is required for dashboard. Install with: pip install -r requirements.txt") from exc
 
@@ -226,7 +281,7 @@ def create_app():
                     authors = [str(authors)]
             except Exception:
                 authors = [str(authors_json)] if authors_json else []
-            authors_text = ", ".join(a for a in authors if a)
+            authors_text = _compact_authors(authors, head=3, tail=2)
             score_norm = max(0.0, min(float(score), 50.0))
             score_pct = (score_norm / 50.0) * 100.0
             published_sort = 0.0
@@ -372,8 +427,15 @@ def create_app():
         store = PaperStore(os.getenv("LIT_DB_PATH", "papers.db"))
         ids = set(parse_paper_ids(request.form.getlist("paper_ids")))
         rows = [r for r in store.top_papers(limit=400) if (r[0], r[1]) in ids]
-        sync_to_zotero(rows, top_n=len(rows))
-        return redirect(url_for("index", msg=f"已导出 {len(rows)} 篇到 Zotero"))
+        if not rows:
+            return redirect(url_for("index", msg="未选择任何论文"))
+        bib = _rows_to_bibtex(rows)
+        filename = f"papers_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bib"
+        return Response(
+            bib,
+            mimetype="application/x-bibtex; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'},
+        )
 
     @app.post("/weekly-report")
     def weekly_report():

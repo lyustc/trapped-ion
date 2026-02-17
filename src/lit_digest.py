@@ -202,8 +202,8 @@ class PaperStore:
     def prune_old_papers(self, keep_days: int = 3) -> int:
         threshold = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         with self._connect() as conn:
-            # Preserve arXiv-tagged papers when pruning by date so recent submissions remain
-            cur = conn.execute("DELETE FROM papers WHERE COALESCE(published_at, created_at) < ? AND tags NOT LIKE ?", (threshold, '%arxiv%'))
+            # Strictly enforce keep_days for all sources (including arXiv)
+            cur = conn.execute("DELETE FROM papers WHERE COALESCE(published_at, created_at) < ?", (threshold,))
             conn.execute("DELETE FROM feedback WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.source=feedback.source AND p.source_id=feedback.source_id)")
             return cur.rowcount
 
