@@ -55,6 +55,7 @@ PAGE = """
     <span>仅保留近 N 天（默认 3 天）</span>
     <label>arXiv 最大条数</label>
     <input type="number" name="arxiv_max_results" min="1" max="500" value="{{ arxiv_max_results }}" style="width:88px" />
+    <label><input type="checkbox" name="quick" value="1" /> 快速模式（仅抓最新 arXiv）</label>
     <button type="submit">更新推荐</button>
   </form>
     <script>
@@ -142,8 +143,13 @@ PAGE = """
   </form>
 
   <form method="post" action="/save-selected" id="selectionForm">
+    <input type="hidden" name="status" value="{{ status }}" />
+    <input type="hidden" name="tag" value="{{ tag }}" />
+    <input type="hidden" name="show_arxiv" value="{{ show_arxiv }}" />
+    <input type="hidden" name="sort_by" value="{{ sort_by }}" />
     <div class="toolbar">
       <button type="submit">保存勾选</button>
+      <button class="secondary" formaction="/mark-all-read" type="submit">一键全部已读</button>
       <button class="secondary" formaction="/mark-read" type="submit">标记为已读</button>
       <button class="secondary" formaction="/mark-unread" type="submit">标记为未读</button>
       <button formaction="/export-selected" type="submit">导出勾选为 BibTeX (.bib)</button>
@@ -267,7 +273,9 @@ def create_app():
 
     def _load_grouped(status: str, tag: str, show_arxiv: str, sort_by: str):
         store = PaperStore(os.getenv("LIT_DB_PATH", "papers.db"))
-        rows = store.top_papers(limit=300, status=status, tag=tag, include_arxiv=(show_arxiv != "0"), sort_by=sort_by)
+        # Use a high limit so category buckets are not accidentally shown as empty
+        # due to truncation from top-N ordering.
+        rows = store.top_papers(limit=2000, status=status, tag=tag, include_arxiv=(show_arxiv != "0"), sort_by=sort_by)
         saved = _saved_map(store)
         temp_grouped: dict[str, list[dict]] = defaultdict(list)
         for source, source_id, title, summary, authors_json, link, published_at, category, score, tags_json, article_type, read_status in rows:
@@ -322,12 +330,11 @@ def create_app():
         ordered = OrderedDict()
         present = set(temp_grouped.keys())
         for c in DISPLAY_CATEGORY_ORDER:
-            if c in present:
-                ordered[c] = temp_grouped.get(c, [])
+            ordered[c] = temp_grouped.get(c, [])
         extras = [c for c in temp_grouped.keys() if c not in DISPLAY_CATEGORY_ORDER and c != "other"]
         for c in sorted(extras):
             ordered[c] = temp_grouped.get(c, [])
-        if "other" in temp_grouped and "other" not in ordered:
+        if "other" not in ordered:
             ordered["other"] = temp_grouped.get("other", [])
         return ordered, store.available_tags()
 
@@ -352,6 +359,7 @@ def create_app():
 
         # keep dashboard simple: use configured default arXiv query; allow adjusting max results
         arxiv_max = int(request.form.get("arxiv_max_results", 40))
+        quick = request.form.get("quick", "0") == "1"
         subs_path = _resolve_subscriptions_path()
 
         run_pipeline(
@@ -360,6 +368,7 @@ def create_app():
             subscriptions_path=subs_path,
             arxiv_max_results=arxiv_max,
             keep_days=keep_days,
+            quick=quick,
         )
         return redirect(url_for("index", msg=f"更新完成，仅保留近 {keep_days} 天", keep_days=keep_days))
 
@@ -414,6 +423,33 @@ def create_app():
         ids = parse_paper_ids(request.form.getlist("paper_ids"))
         store.mark_read_status(ids, "read")
         return redirect(url_for("index", msg=f"已标记已读 {len(ids)} 篇"))
+
+    @app.post("/mark-all-read")
+    def mark_all_read():
+        store = PaperStore(os.getenv("LIT_DB_PATH", "papers.db"))
+        status = request.form.get("status", "all")
+        tag = request.form.get("tag", "")
+        show_arxiv = request.form.get("show_arxiv", "1")
+        sort_by = request.form.get("sort_by", "score")
+        rows = store.top_papers(
+            limit=300,
+            status=status,
+            tag=tag,
+            include_arxiv=(show_arxiv != "0"),
+            sort_by=sort_by,
+        )
+        ids = [(r[0], r[1]) for r in rows]
+        store.mark_read_status(ids, "read")
+        return redirect(
+            url_for(
+                "index",
+                msg=f"已一键标记已读 {len(ids)} 篇",
+                status=status,
+                tag=tag,
+                show_arxiv=show_arxiv,
+                sort_by=sort_by,
+            )
+        )
 
     @app.post("/mark-unread")
     def mark_unread():

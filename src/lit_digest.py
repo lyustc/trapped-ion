@@ -30,10 +30,11 @@ APS_CROSSREF_ISSN = {
     "prx-quantum": "2691-3399",
     "pr-applied": "2331-7019",
 }
+APS_SOURCES = set(APS_CROSSREF_ISSN.keys())
 
 CATEGORY_RULES = {
     "quantum-information": ["quantum information", "logical qubit", "quantum error", "error correction", "logical qubit"],
-    "quantum-computing": ["qubit", "quantum gate", "quantum circuit", "gate", "ion qubit", "superconducting qubit"],
+    "quantum-computing": ["qubit", "quantum gate", "quantum circuit", "gate", "ion qubit", "superconducting qubit", "logical qubits"],
     "quantum-metrology": ["sensing", "metrology", "magnetometer", "interferometer", "metrology"],
     "quantum-simulation": ["quantum simulation", "simulator", "hamiltonian", "many-body", "simulation"],
     "trapped-ion": ["trapped ion", "ion trap", "ion-trap", "towards trapped-ion", "trapped-ion thermometry", "cavity-based eit"],
@@ -56,6 +57,7 @@ TOPIC_TAG_RULES = {
     "quantum-sensing": ["quantum sensing", "magnetometer", "interferometer", "metrology"],
     "theory": ["theory", "theoretical", "proof", "model", "bounds", "derivation"],
     "experiment": ["experiment", "experimental", "measured", "demonstrate", "measurement", "device"],
+    "accept": ["accepted", "accepted for publication", "accepted in", "in press", "to appear"],
 }
 
 ARTICLE_TYPE_RULES = {
@@ -474,10 +476,112 @@ def detect_tags(paper: Paper) -> list[str]:
     for tag, keys in TOPIC_TAG_RULES.items():
         if any(k in text for k in keys):
             tags.append(tag)
+    # APS metadata sometimes exposes just 'Anonymous' for newly accepted/in-press items.
+    # Tag them for easy tracking.
+    try:
+        anon = any((a or "").strip().lower() == "anonymous" for a in (paper.authors or []))
+    except Exception:
+        anon = False
+    if anon and (paper.source in APS_SOURCES):
+        tags.append("accept")
     return tags
 
 
-def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Paper]:
+def _extract_doi_from_link(link: str) -> str:
+    if not link:
+        return ""
+    m = re.search(r"doi\.org/(10\.[^\s/?#]+/[^\s?#]+)", link, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _fetch_authors_from_doi_csl(doi: str) -> list[str]:
+    if not doi:
+        return []
+    import requests
+
+    try:
+        r = requests.get(
+            f"https://doi.org/{doi}",
+            headers={"Accept": "application/vnd.citationstyles.csl+json", "User-Agent": "lit-digest/1.0"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out: list[str] = []
+        for a in data.get("author") or []:
+            family = (a.get("family") or "").strip()
+            given = (a.get("given") or "").strip()
+            name = f"{given} {family}".strip() or family
+            if name:
+                out.append(name)
+        # discard placeholder-only responses
+        if out and all(x.strip().lower() == "anonymous" for x in out):
+            return []
+        return out
+    except Exception:
+        return []
+
+
+def _extract_authors_from_text(raw: str) -> list[str]:
+    if not raw:
+        return []
+    text = re.sub(r"<[^>]+>", " ", raw)
+    # Common patterns in RSS summaries
+    m = re.search(r"(?i)\b(?:authors?|author)\s*[:\-]\s*([^.;\n]{8,300})", text)
+    if not m:
+        return []
+    block = clean_text(m.group(1))
+    # split by common separators
+    parts = re.split(r"\s*(?:,|;|\band\b|&)\s*", block, flags=re.IGNORECASE)
+    names = [clean_text(p) for p in parts if clean_text(p)]
+    # drop placeholders
+    names = [n for n in names if n.lower() not in {"anonymous", "unknown", "n/a"}]
+    return names
+
+
+def _extract_rss_authors(entry) -> list[str]:
+    candidates: list[str] = []
+    if "authors" in entry:
+        for a in entry.authors:
+            name = clean_text(a.get("name", ""))
+            if name:
+                candidates.append(name)
+    if not candidates and "author_detail" in entry:
+        name = clean_text((entry.get("author_detail") or {}).get("name", ""))
+        if name:
+            candidates.append(name)
+    if not candidates and "author" in entry:
+        name = clean_text(entry.get("author", ""))
+        if name:
+            candidates.append(name)
+    # Dublin Core creator fallback
+    if not candidates:
+        for k in ("dc_creator", "dc:creator", "creator"):
+            v = entry.get(k, "")
+            if isinstance(v, str) and clean_text(v):
+                candidates.append(clean_text(v))
+                break
+    # Parse summary if feed only provides placeholder author
+    lowered = {c.lower() for c in candidates}
+    if not candidates or lowered.issubset({"anonymous", "unknown", "n/a"}):
+        from_summary = _extract_authors_from_text(entry.get("summary", "") or entry.get("description", ""))
+        if from_summary:
+            candidates = from_summary
+    # de-dup while preserving order
+    out: list[str] = []
+    seen = set()
+    for c in candidates:
+        key = c.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(c.strip())
+    return out
+
+
+def fetch_arxiv(query: str = "all:quantum", max_results: int = 200, keep_days: int | None = None) -> list[Paper]:
     import requests
     import feedparser
 
@@ -493,7 +597,8 @@ def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Pape
             "search_query": query,
             "start": 0,
             "max_results": req_max,
-            "sortBy": "submittedDate",
+            # Use lastUpdatedDate so filtering aligns with "visible update" time.
+            "sortBy": "lastUpdatedDate",
             "sortOrder": "descending",
         }
         try:
@@ -517,6 +622,12 @@ def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Pape
     feed = feedparser.parse(res_text)
     papers = []
     for entry in feed.entries:
+        # Prefer arXiv update time over submission time.
+        published_at = _parse_date(entry.get("updated", "") or entry.get("published", ""))
+        if keep_days and published_at:
+            # Entries are sorted by submittedDate desc; stop once older than keep_days.
+            if not is_recent(published_at, keep_days=keep_days):
+                break
         papers.append(
             Paper(
                 source="arxiv",
@@ -525,7 +636,7 @@ def fetch_arxiv(query: str = "all:quantum", max_results: int = 200) -> list[Pape
                 summary=clean_text(entry.get("summary", "")),
                 authors=[a.get("name", "") for a in entry.get("authors", [])],
                 link=entry.get("link", ""),
-                published_at=_parse_date(entry.get("published", "")),
+                published_at=published_at,
             )
         )
     return papers
@@ -582,6 +693,10 @@ def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
             if name:
                 authors.append(name)
         doi = (item.get("DOI") or "").strip()
+        if not authors or all((x or "").strip().lower() == "anonymous" for x in authors):
+            by_doi = _fetch_authors_from_doi_csl(doi)
+            if by_doi:
+                authors = by_doi
         link = f"https://doi.org/{doi}" if doi else (item.get("URL") or "")
         source_id = doi or link or title
         papers.append(
@@ -610,11 +725,12 @@ def fetch_rss_feeds(feeds: dict[str, str] | None = None, keep_days: int = 7) -> 
             papers.extend(_fetch_aps_via_crossref(source=source, keep_days=keep_days))
             continue
         for entry in entries:
-            authors = []
-            if "authors" in entry:
-                authors = [a.get("name", "") for a in entry.authors]
-            elif "author" in entry:
-                authors = [entry.get("author", "")]
+            authors = _extract_rss_authors(entry)
+            if not authors or all((x or "").strip().lower() == "anonymous" for x in authors):
+                doi = _extract_doi_from_link(entry.get("link", "") or "")
+                by_doi = _fetch_authors_from_doi_csl(doi)
+                if by_doi:
+                    authors = by_doi
             papers.append(
                 Paper(
                     source=source,
@@ -635,7 +751,11 @@ def load_subscription_config(config_path: str | None = None) -> tuple[str, int, 
         return "all:quantum OR cat:physics.atom-ph", 200, DEFAULT_RSS_FEEDS
     with open(config_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data.get("arxiv_query", "all:quantum"), int(data.get("arxiv_max_results", 40)), data.get("rss_feeds") or DEFAULT_RSS_FEEDS
+    arxiv_query = data.get("arxiv_query", "all:quantum")
+    # Ensure quant-ph is included so relevant titles without "quantum" are not missed.
+    if "cat:quant-ph" not in arxiv_query and "cat:quant" not in arxiv_query:
+        arxiv_query = f"({arxiv_query}) OR cat:quant-ph"
+    return arxiv_query, int(data.get("arxiv_max_results", 40)), data.get("rss_feeds") or DEFAULT_RSS_FEEDS
 
 
 def _parse_date(raw: str) -> str:
@@ -1244,12 +1364,18 @@ def clean_database(db_path: str = "papers.db", keep_days: int = 3) -> dict:
     return {"reclustered": reclustered, "deleted": deleted}
 
 
-def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.db", subscriptions_path: str | None = None, keep_days: int = 3, arxiv_max_results: int | None = None) -> None:
+def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.db", subscriptions_path: str | None = None, keep_days: int = 3, arxiv_max_results: int | None = None, quick: bool = False) -> None:
+    t0 = time.perf_counter()
     profile = PreferenceProfile.from_history(history_path)
     store = PaperStore(db_path)
     arxiv_query, cfg_arxiv_max_results, feeds = load_subscription_config(subscriptions_path)
     use_max = cfg_arxiv_max_results if arxiv_max_results is None else int(arxiv_max_results)
-    papers = fetch_arxiv(query=arxiv_query, max_results=use_max) + fetch_rss_feeds(feeds=feeds, keep_days=keep_days)
+    if quick:
+        use_max = min(use_max, 50)
+    t_fetch = time.perf_counter()
+    arxiv_keep = keep_days if quick else None
+    papers = fetch_arxiv(query=arxiv_query, max_results=use_max, keep_days=arxiv_keep) + fetch_rss_feeds(feeds=feeds, keep_days=keep_days)
+    t_scoring = time.perf_counter()
     # Define which detected categories are considered "quantum" (keep them distinct)
     quantum_categories = {k for k in CATEGORY_RULES.keys() if ('quantum' in k) or (k in ('trapped-ion', 'quantum-platform'))}
     # Allowed journal sources for 'other' category (exclude arXiv and Nature Communications)
@@ -1300,11 +1426,18 @@ def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.
         article_type = detect_article_type(paper)
         score = profile.score(paper)
         store.upsert(paper, category=category, score=score, tags=tags, article_type=article_type)
+    t_prune = time.perf_counter()
     store.prune_old_papers(keep_days=keep_days)
     top_rows = store.top_papers(limit=200)
     with open("digest.md", "w", encoding="utf-8") as f:
         f.write(build_digest_markdown(top_rows))
     sync_to_zotero(top_rows)
+    t_done = time.perf_counter()
+    print(
+        "[timing] fetch={:.2f}s score+upsert={:.2f}s prune+write={:.2f}s total={:.2f}s".format(
+            t_scoring - t_fetch, t_prune - t_scoring, t_done - t_prune, t_done - t0
+        )
+    )
 
 
 def main() -> None:
@@ -1329,6 +1462,7 @@ def main() -> None:
     parser.add_argument("--report-days", type=int, default=7, help="Days for weekly report")
     parser.add_argument("--mark-read", nargs="*", default=[], help="IDs source||source_id ...")
     parser.add_argument("--mark-unread", nargs="*", default=[], help="IDs source||source_id ...")
+    parser.add_argument("--quick", action="store_true", help="Quick mode: only fetch latest arXiv entries")
     args = parser.parse_args()
     store = PaperStore(args.db)
     if args.recluster:
@@ -1368,7 +1502,7 @@ def main() -> None:
         store.mark_read_status(ids, "unread")
         return
     subscriptions = args.subscriptions if Path(args.subscriptions).exists() else None
-    run_pipeline(history_path=args.history, db_path=args.db, subscriptions_path=subscriptions, keep_days=args.keep_days)
+    run_pipeline(history_path=args.history, db_path=args.db, subscriptions_path=subscriptions, keep_days=args.keep_days, quick=args.quick)
 
 
 if __name__ == "__main__":
