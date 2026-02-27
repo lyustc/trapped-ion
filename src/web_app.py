@@ -454,7 +454,7 @@ def create_app():
                 try:
                     from src.lit_digest import update_preferences_from_zotero_export
 
-                    update_preferences_from_zotero_export(tmp.name, history_path=out_path, top_k_keywords=100)
+                    update_preferences_from_zotero_export(tmp.name, history_path=out_path, top_k_keywords=200)
                 except Exception as e:
                     return redirect(url_for('index', msg=f'覆盖失败: {e}'))
                 return redirect(url_for('index', msg=f'偏好已覆盖写入 {out_path}'))
@@ -462,7 +462,7 @@ def create_app():
                 try:
                     from src.lit_digest import build_preferences_from_zotero_export
 
-                    build_preferences_from_zotero_export(tmp.name, output_path=out_path, top_k_keywords=100)
+                    build_preferences_from_zotero_export(tmp.name, output_path=out_path, top_k_keywords=200)
                 except Exception as e:
                     return redirect(url_for('index', msg=f'生成预览失败: {e}'))
                 return redirect(url_for('index', msg=f'已生成 {out_path} 供审阅'))

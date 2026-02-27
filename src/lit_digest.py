@@ -978,7 +978,7 @@ def build_digest_markdown(rows: Iterable[tuple]) -> str:
     return "\n".join(lines)
 
 
-def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords: int = 100) -> dict:
+def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords: int = 200) -> dict:
     # Build text corpus and collect simple counts from the Zotero records
     corpus: list[str] = []
     authors = Counter()
@@ -1230,7 +1230,7 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
         s = f" {kw.lower()} "
         return any(x in s for x in [" ion ", " ions ", " trapped ion ", " ion trap ", "trapped-ion"])
 
-    def _finalize_keywords(raw_keywords: list[str], target_k: int = 100) -> list[str]:
+    def _finalize_keywords(raw_keywords: list[str], target_k: int = 200) -> list[str]:
         out: list[str] = []
         seen_ion: set[tuple[str, ...]] = set()
         ion_keep = 0
@@ -1276,7 +1276,7 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
         return out
 
     # Prefer YAKE keywords; fallback to heuristic phrases/tokens.
-    candidate_k = max(int(top_k_keywords), 100)
+    candidate_k = max(int(top_k_keywords), 200)
     keywords: list[str] = []
     keywords = _extract_keywords_with_yake(text_blob, candidate_k)
     if not keywords and phrase_counts:
@@ -1291,8 +1291,8 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
     keywords.extend([t for t, _ in zotero_tags.most_common(30)])
     keywords.extend([c for c, _ in collections.most_common(30)])
     # Final normalization/dedup and fixed size bucket.
-    keywords = _finalize_keywords(keywords, target_k=100)
-    if len(keywords) < 100:
+    keywords = _finalize_keywords(keywords, target_k=200)
+    if len(keywords) < 200:
         blocked_fill_tokens = {"ion", "ions", "trapped", "trap", "trapped-ion", "ion-trap", "quantum", "system", "systems"}
         token_counts = Counter(
             t for t in tokenize_text(text_blob)
@@ -1303,7 +1303,7 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
             if not t or t in keywords or t in blocked_fill_tokens:
                 continue
             keywords.append(t)
-            if len(keywords) >= 100:
+            if len(keywords) >= 200:
                 break
 
     # Build tags from multiple sources: explicit zotero tags/collections, and mapped broad categories
@@ -1358,7 +1358,7 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
 
     primary = {
         "weight": 2.0,
-        "keywords": keywords[:100],
+        "keywords": keywords[:200],
         "keyword_weights": keyword_weights,
         "authors": expanded_authors,
         "author_weights": author_weights,
@@ -1367,7 +1367,7 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
     return {"likes": [primary]}
 
 
-def build_preferences_from_zotero_export(zotero_export_path: str, output_path: str = "preferences.generated.json", top_k_keywords: int = 100) -> None:
+def build_preferences_from_zotero_export(zotero_export_path: str, output_path: str = "preferences.generated.json", top_k_keywords: int = 200) -> None:
     with open(zotero_export_path, "r", encoding="utf-8") as f:
         records = json.load(f)
     pref = _generate_preference_from_zotero_records(records, top_k_keywords=top_k_keywords)
@@ -1375,7 +1375,7 @@ def build_preferences_from_zotero_export(zotero_export_path: str, output_path: s
         json.dump(pref, f, ensure_ascii=False, indent=2)
 
 
-def update_preferences_from_zotero_export(zotero_export_path: str, history_path: str = "preferences.json", top_k_keywords: int = 100) -> None:
+def update_preferences_from_zotero_export(zotero_export_path: str, history_path: str = "preferences.json", top_k_keywords: int = 200) -> None:
     # Overwrite mode: regenerate preferences from export and replace history file.
     gen = _generate_preference_from_zotero_records(
         json.load(open(zotero_export_path, encoding="utf-8")),
