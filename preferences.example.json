@@ -1,14 +1,37 @@
 {
   "likes": [
     {
-      "weight": 2.5,
-      "keywords": ["trapped ion", "quantum error correction", "entanglement"],
-      "authors": ["Rainer Blatt", "Christopher Monroe"]
-    },
-    {
-      "weight": 1.5,
-      "keywords": ["llm", "scientific discovery", "materials"],
-      "authors": ["Yoshua Bengio"]
+      "weight": 2.0,
+      "keywords": [
+        "quantum error correction",
+        "quantum simulation",
+        "open quantum systems",
+        "trapped ion quantum"
+      ],
+      "keyword_weights": {
+        "quantum error correction": 2.0,
+        "quantum simulation": 2.0,
+        "open quantum systems": 1.0,
+        "trapped ion quantum": 1.0
+      },
+      "authors": [
+        "Blatt, Rainer",
+        "Monroe, Christopher",
+        "Zou, Chang-Ling",
+        "Sun, Luyan"
+      ],
+      "author_weights": {
+        "Blatt, Rainer": 2.0,
+        "Monroe, Christopher": 2.0,
+        "Zou, Chang-Ling": 1.0,
+        "Sun, Luyan": 1.0
+      },
+      "tags": [
+        "trapped-ion",
+        "quantum-computing",
+        "quantum-information",
+        "quantum-sensing"
+      ]
     }
   ]
 }

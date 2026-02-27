@@ -93,23 +93,31 @@ class PreferenceProfile:
         authors: dict[str, float] = {}
         for item in data.get("likes", []):
             weight = float(item.get("weight", 1.0))
+            keyword_weights = item.get("keyword_weights", {}) if isinstance(item.get("keyword_weights", {}), dict) else {}
+            author_weights = item.get("author_weights", {}) if isinstance(item.get("author_weights", {}), dict) else {}
             for kw in item.get("keywords", []):
                 k = kw.strip().lower()
                 if k:
-                    keywords[k] = keywords.get(k, 0.0) + weight
+                    kw_w = float(keyword_weights.get(kw, keyword_weights.get(k, 1.0)))
+                    keywords[k] = keywords.get(k, 0.0) + (weight * kw_w)
             for au in item.get("authors", []):
                 a = au.strip().lower()
                 if a:
-                    authors[a] = authors.get(a, 0.0) + weight
+                    aw = float(author_weights.get(au, 1.0))
+                    authors[a] = authors.get(a, 0.0) + (weight * aw)
         return cls(keywords=keywords, authors=authors)
 
     def score(self, paper: Paper) -> float:
         text = f"{paper.title} {paper.summary}".lower()
         kw_score = sum(weight for kw, weight in self.keywords.items() if kw in text)
-        author_score = sum(self.authors.get(author.lower(), 0.0) * 1.5 for author in paper.authors)
+        author_score = 0.0
+        for author in paper.authors:
+            akey = normalize_author_name(author).lower()
+            author_score += self.authors.get(akey, 0.0) * 1.5
         embed_score = cosine_similarity(self.keyword_vector, text_to_embedding(text)) * 4.0
         novelty_penalty = max(0, len(text.split()) - 800) / 400
-        base = 0.35 * kw_score + 0.25 * author_score + 0.40 * embed_score - novelty_penalty
+        # User tuning: halve keyword impact and double author impact.
+        base = 0.175 * kw_score + 0.50 * author_score + 0.40 * embed_score - novelty_penalty
         # scale to match expected scoring range in tests
         return round(base * 3.0, 3)
 
@@ -388,26 +396,66 @@ def normalize_author_name(raw: str) -> str:
             given = " ".join(toks[:-1])
     family = family.strip()
     given = given.strip()
-    if given:
-        return f"{family}, {given}"
-    return family
+    normalized = f"{family}, {given}" if given else family
+    return _canonicalize_known_author_alias(normalized)
+
+
+def _canonicalize_known_author_alias(name: str) -> str:
+    # User-confirmed aliases for specific authors.
+    # Keep this list intentionally small and explicit.
+    if not name:
+        return ""
+    fam, given = _author_norm_parts(name)
+    if fam == "sun" and given in {"l", "ly", "luyan"}:
+        return "Sun, Luyan"
+    if fam == "zou" and given in {"cl", "changling"}:
+        return "Zou, Chang-Ling"
+    return name
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _author_norm_parts(name: str) -> tuple[str, str]:
+    import unicodedata
+
+    if not name:
+        return ("", "")
+    fam = name.split(",", 1)[0].strip()
+    given = name.split(",", 1)[1].strip() if "," in name else ""
+    fam_norm = re.sub(r"[^A-Za-z]", "", unicodedata.normalize("NFKD", fam)).lower()
+    given_norm = re.sub(r"[^A-Za-z]", "", unicodedata.normalize("NFKD", given)).lower()
+    return fam_norm, given_norm
+
+
+def _is_initials_given(given_raw: str, given_norm: str) -> bool:
+    # e.g., "C.", "D J", "L.-M." are treated as initials-like.
+    if not given_norm:
+        return True
+    if len(given_norm) <= 2:
+        return True
+    raw = (given_raw or "").strip()
+    if raw and bool(re.fullmatch(r"[A-Za-z](?:[\.\-\s]*[A-Za-z]){0,3}\.?", raw)):
+        return True
+    return False
+
+
+NO_INITIAL_MERGE_FAMILIES = {
+    # Common romanized Chinese surnames: avoid initial-based merge to reduce false merges.
+    "zhang", "wang", "xu", "wu", "chen", "li",
+    "liu", "yang", "zhao", "huang", "zhou", "sun",
+    "ma", "hu", "guo", "he", "gao", "lin", "lu",
+}
+
+
+def _allow_initial_merge_for_family(family_norm: str) -> bool:
+    return bool(family_norm) and family_norm not in NO_INITIAL_MERGE_FAMILIES
 
 
 def author_key(name: str) -> tuple[str, str]:
-    # normalized matching key: (family_lower_normalized, first_initial)
-    import unicodedata
-    if not name:
-        return ("", "")
-    fam = name.split(',', 1)[0].strip()
-    fam_norm = unicodedata.normalize('NFKD', fam)
-    fam_norm = re.sub(r"[^A-Za-z]", "", fam_norm).lower()
-    given = ""
-    if "," in name:
-        given = name.split(',', 1)[1].strip()
-    given_norm = unicodedata.normalize('NFKD', given)
-    given_norm = re.sub(r"[^A-Za-z]", "", given_norm).lower()
-    initial = given_norm[0] if given_norm else (fam_norm[0] if fam_norm else "")
-    return (fam_norm, initial)
+    fam_norm, given_norm = _author_norm_parts(name)
+    return (fam_norm, given_norm)
 
 
 def build_weighted_profile_vector(keywords: dict[str, float], dim: int = EMBED_DIM) -> list[float]:
@@ -496,9 +544,42 @@ def _extract_doi_from_link(link: str) -> str:
     return ""
 
 
-def _fetch_authors_from_doi_csl(doi: str) -> list[str]:
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    return clean_text(re.sub(r"<[^>]+>", " ", text))
+
+
+def _extract_rss_summary(entry) -> str:
+    # Prefer the richest textual field, then fall back.
+    candidates: list[str] = []
+    content = entry.get("content") or []
+    if content and isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict):
+                candidates.append(c.get("value", "") or "")
+    candidates.append(entry.get("summary", "") or "")
+    candidates.append(entry.get("description", "") or "")
+    best = ""
+    for c in candidates:
+        s = _strip_html(c)
+        if len(s) > len(best):
+            best = s
+    return best
+
+
+def _normalize_summary_for_source(source: str, summary: str) -> str:
+    s = clean_text(summary or "")
+    src = (source or "").lower()
+    if src.startswith("nature"):
+        # Remove boilerplate like "Nature, Published online ... doi:10...."
+        s = re.sub(r"(?i)^nature[^.]*doi:\s*10\.\S+\s*", "", s).strip()
+    return s
+
+
+def _fetch_csl_metadata(doi: str) -> dict:
     if not doi:
-        return []
+        return {}
     import requests
 
     try:
@@ -508,8 +589,19 @@ def _fetch_authors_from_doi_csl(doi: str) -> list[str]:
             timeout=20,
         )
         if r.status_code != 200:
+            return {}
+        return r.json() if isinstance(r.json(), dict) else {}
+    except Exception:
+        return {}
+
+
+def _fetch_authors_from_doi_csl(doi: str) -> list[str]:
+    if not doi:
+        return []
+    try:
+        data = _fetch_csl_metadata(doi)
+        if not data:
             return []
-        data = r.json()
         out: list[str] = []
         for a in data.get("author") or []:
             family = (a.get("family") or "").strip()
@@ -523,6 +615,17 @@ def _fetch_authors_from_doi_csl(doi: str) -> list[str]:
         return out
     except Exception:
         return []
+
+
+def _fetch_abstract_from_doi_csl(doi: str) -> str:
+    if not doi:
+        return ""
+    try:
+        data = _fetch_csl_metadata(doi)
+        abs_text = data.get("abstract", "") if data else ""
+        return _strip_html(abs_text)
+    except Exception:
+        return ""
 
 
 def _extract_authors_from_text(raw: str) -> list[str]:
@@ -581,7 +684,12 @@ def _extract_rss_authors(entry) -> list[str]:
     return out
 
 
-def fetch_arxiv(query: str = "all:quantum", max_results: int = 200, keep_days: int | None = None) -> list[Paper]:
+def fetch_arxiv(
+    query: str = "all:quantum",
+    max_results: int = 200,
+    keep_days: int | None = None,
+    deadline: float | None = None,
+) -> list[Paper]:
     import requests
     import feedparser
 
@@ -656,7 +764,14 @@ def _parse_crossref_date(item: dict) -> str:
     return ""
 
 
-def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
+def _fetch_aps_via_crossref(
+    source: str,
+    keep_days: int,
+    perf: dict | None = None,
+    deadline: float | None = None,
+    enable_doi_author: bool = True,
+    enable_doi_abs: bool = True,
+) -> list[Paper]:
     import requests
 
     issn = APS_CROSSREF_ISSN.get(source)
@@ -684,7 +799,7 @@ def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
         title = clean_text(title_list[0] if title_list else "")
         if not title:
             continue
-        abstract = re.sub(r"<[^>]+>", " ", item.get("abstract") or "")
+        abstract = _strip_html(item.get("abstract") or "")
         authors = []
         for a in item.get("author") or []:
             given = (a.get("given") or "").strip()
@@ -693,10 +808,24 @@ def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
             if name:
                 authors.append(name)
         doi = (item.get("DOI") or "").strip()
-        if not authors or all((x or "").strip().lower() == "anonymous" for x in authors):
-            by_doi = _fetch_authors_from_doi_csl(doi)
-            if by_doi:
-                authors = by_doi
+        if enable_doi_author and (deadline is None or time.perf_counter() < deadline) and (not authors or all((x or "").strip().lower() == "anonymous" for x in authors)):
+            if deadline is None or (deadline - time.perf_counter()) > 3.0:
+                t0 = time.perf_counter()
+                by_doi = _fetch_authors_from_doi_csl(doi)
+                if perf is not None:
+                    perf["doi_author_calls"] = perf.get("doi_author_calls", 0) + 1
+                    perf["doi_author_sec"] = perf.get("doi_author_sec", 0.0) + (time.perf_counter() - t0)
+                if by_doi:
+                    authors = by_doi
+        if enable_doi_abs and (deadline is None or time.perf_counter() < deadline) and len(clean_text(abstract)) < 80:
+            if deadline is None or (deadline - time.perf_counter()) > 3.0:
+                t0 = time.perf_counter()
+                abs_doi = _fetch_abstract_from_doi_csl(doi)
+                if perf is not None:
+                    perf["doi_abs_calls"] = perf.get("doi_abs_calls", 0) + 1
+                    perf["doi_abs_sec"] = perf.get("doi_abs_sec", 0.0) + (time.perf_counter() - t0)
+                if abs_doi:
+                    abstract = abs_doi
         link = f"https://doi.org/{doi}" if doi else (item.get("URL") or "")
         source_id = doi or link or title
         papers.append(
@@ -704,7 +833,7 @@ def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
                 source=source,
                 source_id=source_id,
                 title=title,
-                summary=clean_text(abstract),
+                summary=_normalize_summary_for_source(source, clean_text(abstract)),
                 authors=authors,
                 link=link,
                 published_at=_parse_crossref_date(item),
@@ -713,7 +842,14 @@ def _fetch_aps_via_crossref(source: str, keep_days: int) -> list[Paper]:
     return papers
 
 
-def fetch_rss_feeds(feeds: dict[str, str] | None = None, keep_days: int = 7) -> list[Paper]:
+def fetch_rss_feeds(
+    feeds: dict[str, str] | None = None,
+    keep_days: int = 7,
+    perf: dict | None = None,
+    deadline: float | None = None,
+    enable_doi_author: bool = True,
+    enable_doi_abs: bool = True,
+) -> list[Paper]:
     import feedparser
 
     feeds = feeds or DEFAULT_RSS_FEEDS
@@ -722,21 +858,46 @@ def fetch_rss_feeds(feeds: dict[str, str] | None = None, keep_days: int = 7) -> 
         feed = feedparser.parse(url)
         entries = list(getattr(feed, "entries", []) or [])
         if not entries and source in APS_CROSSREF_ISSN:
-            papers.extend(_fetch_aps_via_crossref(source=source, keep_days=keep_days))
+            papers.extend(
+                _fetch_aps_via_crossref(
+                    source=source,
+                    keep_days=keep_days,
+                    perf=perf,
+                    deadline=deadline,
+                    enable_doi_author=enable_doi_author,
+                    enable_doi_abs=enable_doi_abs,
+                )
+            )
             continue
         for entry in entries:
             authors = _extract_rss_authors(entry)
-            if not authors or all((x or "").strip().lower() == "anonymous" for x in authors):
+            if enable_doi_author and (deadline is None or time.perf_counter() < deadline) and (not authors or all((x or "").strip().lower() == "anonymous" for x in authors)):
                 doi = _extract_doi_from_link(entry.get("link", "") or "")
-                by_doi = _fetch_authors_from_doi_csl(doi)
-                if by_doi:
-                    authors = by_doi
+                if deadline is None or (deadline - time.perf_counter()) > 3.0:
+                    t0 = time.perf_counter()
+                    by_doi = _fetch_authors_from_doi_csl(doi)
+                    if perf is not None:
+                        perf["doi_author_calls"] = perf.get("doi_author_calls", 0) + 1
+                        perf["doi_author_sec"] = perf.get("doi_author_sec", 0.0) + (time.perf_counter() - t0)
+                    if by_doi:
+                        authors = by_doi
+            summary = _extract_rss_summary(entry)
+            doi = _extract_doi_from_link(entry.get("link", "") or "")
+            if enable_doi_abs and (deadline is None or time.perf_counter() < deadline) and len(summary) < 80 and doi:
+                if deadline is None or (deadline - time.perf_counter()) > 3.0:
+                    t0 = time.perf_counter()
+                    abs_doi = _fetch_abstract_from_doi_csl(doi)
+                    if perf is not None:
+                        perf["doi_abs_calls"] = perf.get("doi_abs_calls", 0) + 1
+                        perf["doi_abs_sec"] = perf.get("doi_abs_sec", 0.0) + (time.perf_counter() - t0)
+                    if abs_doi:
+                        summary = abs_doi
             papers.append(
                 Paper(
                     source=source,
                     source_id=entry.get("id") or entry.get("link", ""),
                     title=clean_text(entry.get("title", "")),
-                    summary=clean_text(entry.get("summary", "")),
+                    summary=_normalize_summary_for_source(source, summary),
                     authors=authors,
                     link=entry.get("link", ""),
                     published_at=_parse_date(entry.get("published", "") or entry.get("updated", "")),
@@ -834,8 +995,8 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
         # obvious HTML/Chinese noise from Zotero export
         if any(ch in s for ch in ['到外部网站', '链接', 'http', 'www.', '<', '>']):
             return True
-        # keep CJK names (allow Chinese authors); do not filter by CJK presence
-        return False
+        if _contains_cjk(s):
+            return True
         # too long or contains many non-letter chars
         if len(s) > 80:
             return True
@@ -848,25 +1009,30 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
         return False
 
     def _author_key(std_name: str) -> tuple[str, str]:
-        # return a dedupe key: (family_normalized, first_initial)
-        import unicodedata
-        parts = [p.strip() for p in std_name.split(",", 1)]
-        family = parts[0] if parts else std_name
-        given = parts[1] if len(parts) > 1 else ""
-        # normalize to remove diacritics and punctuation for matching
-        def norm(s: str) -> str:
-            s2 = unicodedata.normalize('NFKD', s)
-            s2 = re.sub(r"[^A-Za-z]", "", s2)
-            return s2.lower()
-        family_n = norm(family) or norm(std_name)
-        given_n = norm(given)
-        first_initial = given_n[0] if given_n else (family_n[0] if family_n else "")
-        return (family_n, first_initial)
+        fam_n, given_n = _author_norm_parts(std_name)
+        return (fam_n, given_n)
 
-    def _dedupe_authors(counter: Counter) -> list[str]:
+    def _dedupe_authors(counter: Counter) -> list[tuple[str, int]]:
         buckets: dict[tuple[str, str], dict] = {}
         for name, cnt in counter.items():
             key = _author_key(name)
+            family_n, given_n = key
+            given_raw = name.split(",", 1)[1].strip() if "," in name else ""
+            init = given_n[:1]
+            initials_like = _is_initials_given(given_raw, given_n)
+
+            if initials_like and init and _allow_initial_merge_for_family(family_n):
+                full_keys = [k for k in buckets.keys() if k[0] == family_n and k[1] and k[1][:1] == init and not k[1].startswith("__init__:")]
+                if full_keys:
+                    key = full_keys[0]
+                else:
+                    key = (family_n, f"__init__:{init}")
+            elif init and _allow_initial_merge_for_family(family_n):
+                init_key = (family_n, f"__init__:{init}")
+                if init_key in buckets and key not in buckets:
+                    moved = buckets.pop(init_key)
+                    buckets[key] = {'name': name, 'count': moved['count']}
+
             if key in buckets:
                 entry = buckets[key]
                 chosen = name if len(name) > len(entry['name']) else entry['name']
@@ -877,27 +1043,8 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
 
         # Merge across same family (different initials) to handle variants like
         # 'Smith, J.' and 'Smith, John' — aggregate by family and pick best name
-        family_groups: dict[str, dict] = {}
-        for (family_n, init), entry in buckets.items():
-            grp = family_groups.setdefault(family_n, {'count': 0, 'names': []})
-            grp['count'] += entry['count']
-            grp['names'].append(entry)
-
-        merged: list[dict] = []
-        for family_n, grp in family_groups.items():
-            if len(grp['names']) == 1:
-                merged.append(grp['names'][0])
-            else:
-                # choose representative name: prefer the one with longest given part,
-                # then highest count
-                best = max(grp['names'], key=lambda e: (len(e['name']), e['count']))
-                total = sum(e['count'] for e in grp['names'])
-                best_entry = {'name': best['name'], 'count': total}
-                merged.append(best_entry)
-
-        # sort by total count desc and return canonical names
-        items = sorted(merged, key=lambda x: x['count'], reverse=True)
-        return [i['name'] for i in items]
+        items = sorted(buckets.values(), key=lambda x: x['count'], reverse=True)
+        return [(i['name'], int(i['count'])) for i in items]
     for rec in records:
         title = rec.get("title", "") or ""
         abstract = rec.get("abstractNote", "") or ""
@@ -942,11 +1089,43 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
     stopwords = {
         "with", "from", "that", "this", "their", "have", "using", "into", "results",
         "study", "analysis", "and", "or", "the", "a", "an", "for", "of", "in", "on",
+        "through", "between", "among", "across", "toward", "towards", "via",
     }
+    blocked_keyword_tokens = {
+        "pdf", "supplementary", "appendix", "copyright", "license", "accepted",
+    }
+    blocked_keyword_phrases = {
+        "the two", "the trapped", "in this", "of the", "for the", "to the",
+        "trap quantum", "system quantum", "quantum systems quantum", "ion quantum",
+    }
+    blocked_single_keywords = {
+        "quantum", "system", "systems", "trap", "trapped", "ion", "ions", "paper", "result",
+    }
+
+    def _is_good_keyword_phrase(kw: str) -> bool:
+        k = (kw or "").strip().lower()
+        if not k:
+            return False
+        if k in blocked_keyword_phrases:
+            return False
+        toks = [t for t in re.findall(r"[a-zA-Z]{2,}", k)]
+        if len(toks) == 1:
+            return toks[0] not in blocked_single_keywords
+        if len(toks) < 2 or len(toks) > 5:
+            return False
+        if toks[0] in stopwords:
+            return False
+        if any(t in blocked_keyword_tokens for t in toks):
+            return False
+        # keep phrases with enough content words
+        content = [t for t in toks if t not in stopwords]
+        if len(content) < 2:
+            return False
+        return True
     phrase_pattern = re.compile(r"\b(?:[a-zA-Z]{3,}\s+){1,}[a-zA-Z]{3,}\b")
     candidates = [p.lower() for p in phrase_pattern.findall(text_blob)]
 
-    # filter candidate phrases: remove those dominated by stopwords or digits
+    # filter candidate phrases: remove low-information/boilerplate phrases
     filtered = []
     for p in candidates:
         toks = [t for t in re.findall(r"[a-zA-Z]{3,}", p)]
@@ -956,17 +1135,176 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
             continue
         if all(t in stopwords for t in toks):
             continue
-        filtered.append(" ".join(toks))
+        phrase = " ".join(toks)
+        if not _is_good_keyword_phrase(phrase):
+            continue
+        filtered.append(phrase)
 
     phrase_counts = Counter(filtered)
 
-    # If not enough phrases found, fall back to single-token keywords (as before)
+    def _extract_keywords_with_yake(text: str, top_k: int) -> list[str]:
+        # Optional extractor: if YAKE is unavailable, caller should fall back.
+        try:
+            import yake  # type: ignore
+        except Exception:
+            return []
+        try:
+            extractor = yake.KeywordExtractor(
+                lan="en",
+                n=3,
+                dedupLim=0.9,
+                dedupFunc="seqm",
+                windowsSize=1,
+                top=max(top_k * 2, 40),
+            )
+            kws = extractor.extract_keywords(text or "")
+            out: list[str] = []
+            for kw, _score in kws:
+                k = clean_text(kw).lower().strip()
+                if _is_good_keyword_phrase(k) and k not in out:
+                    out.append(k)
+                if len(out) >= top_k:
+                    break
+            return out
+        except Exception:
+            return []
+
+    def _normalize_keyword_text(kw: str) -> str:
+        k = clean_text((kw or "").lower().strip())
+        k = k.replace("trapped-ion", "trapped ion").replace("ion-trap", "ion trap")
+        toks = [t for t in re.findall(r"[a-zA-Z]{2,}", k)]
+        if not toks:
+            return ""
+        # Collapse trapped-ion prefixed phrases to minimal unit.
+        if len(toks) >= 2 and toks[0] == "trapped" and toks[1] in {"ion", "ions"}:
+            toks = ["trapped", "ion"]
+        # Drop leading generic ion prefix: "ion quantum simulator" -> "quantum simulator".
+        if len(toks) >= 2 and toks[0] in {"ion", "ions"}:
+            toks = toks[1:]
+        # remove immediate repeats: "quantum simulator quantum" -> "quantum simulator"
+        dedup_seq: list[str] = []
+        for t in toks:
+            if not dedup_seq or dedup_seq[-1] != t:
+                dedup_seq.append(t)
+        # strip trailing token if it repeats the head token
+        if len(dedup_seq) >= 3 and dedup_seq[-1] == dedup_seq[0]:
+            dedup_seq = dedup_seq[:-1]
+        out = " ".join(dedup_seq)
+        return out
+
+    def _keyword_tokens(kw: str) -> list[str]:
+        return [t for t in re.findall(r"[a-zA-Z]{2,}", (kw or "").lower())]
+
+    def _token_jaccard(a: list[str], b: list[str]) -> float:
+        sa, sb = set(a), set(b)
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / max(1, len(sa | sb))
+
+    def _ion_signature(kw: str) -> tuple[str, ...]:
+        toks = [t for t in re.findall(r"[a-zA-Z]{2,}", kw.lower())]
+        if not toks:
+            return ()
+        # Normalize simple variants and unify trapped-ion expressions.
+        norm: list[str] = []
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t.endswith("s") and len(t) > 3:
+                t = t[:-1]
+            if t == "ions":
+                t = "ion"
+            if i + 1 < len(toks):
+                nxt = toks[i + 1]
+                if (t, nxt) in {("trapped", "ion"), ("ion", "trap"), ("ion", "trapped"), ("trapped", "ions")}:
+                    norm.append("trapped_ion")
+                    i += 2
+                    continue
+            norm.append(t)
+            i += 1
+        # Drop high-frequency generic terms to improve semantic dedup.
+        core = [t for t in norm if t not in {"quantum", "system", "state", "using"}]
+        return tuple(sorted(dict.fromkeys(core)))
+
+    def _is_ion_like(kw: str) -> bool:
+        s = f" {kw.lower()} "
+        return any(x in s for x in [" ion ", " ions ", " trapped ion ", " ion trap ", "trapped-ion"])
+
+    def _finalize_keywords(raw_keywords: list[str], target_k: int = 100) -> list[str]:
+        out: list[str] = []
+        seen_ion: set[tuple[str, ...]] = set()
+        ion_keep = 0
+        max_ion_keep = 12
+        trapped_prefix_keep = 0
+        max_trapped_prefix_keep = 1
+        head_limit = 8
+        head_counts: Counter = Counter()
+        selected_tokens: list[list[str]] = []
+        for kw in raw_keywords:
+            k = _normalize_keyword_text(kw)
+            if not k:
+                continue
+            toks = _keyword_tokens(k)
+            if not toks:
+                continue
+            if not _is_good_keyword_phrase(k):
+                continue
+            if k.startswith("trapped ion ") or k == "trapped ion" or k.startswith("trapped ions "):
+                if trapped_prefix_keep >= max_trapped_prefix_keep:
+                    continue
+                trapped_prefix_keep += 1
+            if _is_ion_like(k):
+                if ion_keep >= max_ion_keep:
+                    continue
+                sig = _ion_signature(k)
+                if sig in seen_ion:
+                    continue
+                seen_ion.add(sig)
+                ion_keep += 1
+            head = toks[0]
+            if head_counts[head] >= head_limit:
+                continue
+            # Skip near-duplicate phrases to improve vocabulary diversity.
+            if any(_token_jaccard(toks, st) >= 0.75 for st in selected_tokens):
+                continue
+            if k not in out:
+                out.append(k)
+                selected_tokens.append(toks)
+                head_counts[head] += 1
+            if len(out) >= target_k:
+                break
+        return out
+
+    # Prefer YAKE keywords; fallback to heuristic phrases/tokens.
+    candidate_k = max(int(top_k_keywords), 100)
     keywords: list[str] = []
-    if phrase_counts:
-        keywords = [kw for kw, _ in phrase_counts.most_common(top_k_keywords)]
-    else:
-        token_counts = Counter(t for t in tokenize_text(text_blob) if len(t) > 3)
-        keywords = [k for k, _ in token_counts.most_common(top_k_keywords) if k not in stopwords]
+    keywords = _extract_keywords_with_yake(text_blob, candidate_k)
+    if not keywords and phrase_counts:
+        keywords = [kw for kw, _ in phrase_counts.most_common(candidate_k) if _is_good_keyword_phrase(kw)]
+    if not keywords:
+        token_counts = Counter(
+            t for t in tokenize_text(text_blob)
+            if len(t) > 3 and t not in stopwords and t not in blocked_keyword_tokens
+        )
+        keywords = [k for k, _ in token_counts.most_common(candidate_k)]
+    # Add extra domain signals for variety.
+    keywords.extend([t for t, _ in zotero_tags.most_common(30)])
+    keywords.extend([c for c, _ in collections.most_common(30)])
+    # Final normalization/dedup and fixed size bucket.
+    keywords = _finalize_keywords(keywords, target_k=100)
+    if len(keywords) < 100:
+        blocked_fill_tokens = {"ion", "ions", "trapped", "trap", "trapped-ion", "ion-trap", "quantum", "system", "systems"}
+        token_counts = Counter(
+            t for t in tokenize_text(text_blob)
+            if len(t) > 3 and t not in stopwords and t not in blocked_keyword_tokens
+        )
+        for tok, _ in token_counts.most_common(500):
+            t = tok.strip().lower()
+            if not t or t in keywords or t in blocked_fill_tokens:
+                continue
+            keywords.append(t)
+            if len(keywords) >= 100:
+                break
 
     # Build tags from multiple sources: explicit zotero tags/collections, and mapped broad categories
     tags = []
@@ -986,28 +1324,42 @@ def _generate_preference_from_zotero_records(records: list[dict], top_k_keywords
     # include top keyword stems as editable tags (limit to a few)
     tags.extend([k for k in keywords[:6]])
 
-    # normalize tags (unique, lower-case)
+    # normalize tags (unique, lower-case) with synonym merge/cleanup
     norm_tags = []
+    blocked_tags = {"pdf", "advanced"}
+    tag_aliases = {
+        "trapped ion": "trapped-ion",
+        "trapped ions": "trapped-ion",
+        "trapped-ions": "trapped-ion",
+        "quantum sensing": "quantum-sensing",
+        "enhanced sensing": "quantum-sensing",
+        "enhanced-sensing": "quantum-sensing",
+    }
     for t in tags:
         if not t:
             continue
         t2 = t.strip().lower()
+        t2 = tag_aliases.get(t2, t2)
+        if t2 in blocked_tags:
+            continue
         if t2 and t2 not in norm_tags:
             norm_tags.append(t2)
 
     deduped_authors = _dedupe_authors(authors)
-    # build expanded author list: top 20 primary (higher weight) + next 100 secondary
-    expanded_authors = deduped_authors[:120]
+    # Keep all authors appearing more than 10 times.
+    expanded_author_items = [(name, cnt) for name, cnt in deduped_authors if cnt > 10]
+    expanded_authors = [name for name, _cnt in expanded_author_items]
     author_weights: dict[str, float] = {}
-    for i, name in enumerate(expanded_authors):
-        if i < 20:
-            author_weights[name] = 2.0
-        else:
-            author_weights[name] = 1.0
+    for name, cnt in expanded_author_items:
+        author_weights[name] = 2.0 if cnt > 20 else 1.0
+    keyword_weights: dict[str, float] = {}
+    for i, kw in enumerate(keywords):
+        keyword_weights[kw] = 2.0 if i < 20 else 1.0
 
     primary = {
         "weight": 2.0,
-        "keywords": keywords[:top_k_keywords],
+        "keywords": keywords[:100],
+        "keyword_weights": keyword_weights,
         "authors": expanded_authors,
         "author_weights": author_weights,
         "tags": norm_tags,
@@ -1024,14 +1376,13 @@ def build_preferences_from_zotero_export(zotero_export_path: str, output_path: s
 
 
 def update_preferences_from_zotero_export(zotero_export_path: str, history_path: str = "preferences.json", top_k_keywords: int = 100) -> None:
-    gen = _generate_preference_from_zotero_records(json.load(open(zotero_export_path, encoding="utf-8")), top_k_keywords=top_k_keywords)
-    if Path(history_path).exists():
-        base = json.load(open(history_path, encoding="utf-8"))
-    else:
-        base = {"likes": []}
-    merged = merge_preference_profiles(base, gen)
+    # Overwrite mode: regenerate preferences from export and replace history file.
+    gen = _generate_preference_from_zotero_records(
+        json.load(open(zotero_export_path, encoding="utf-8")),
+        top_k_keywords=top_k_keywords,
+    )
     with open(history_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
+        json.dump(gen, f, ensure_ascii=False, indent=2)
 
 
 def merge_preference_profiles(base: dict, generated: dict) -> dict:
@@ -1068,7 +1419,25 @@ def merge_preference_profiles(base: dict, generated: dict) -> dict:
         name = normalize_author_name(raw)
         if not name:
             return
+        if _contains_cjk(name):
+            return
         key = author_key(name)
+        family_n, given_n = key
+        given_raw = name.split(",", 1)[1].strip() if "," in name else ""
+        init = given_n[:1]
+        initials_like = _is_initials_given(given_raw, given_n)
+
+        if initials_like and init and _allow_initial_merge_for_family(family_n):
+            full_keys = [k for k in buckets.keys() if k[0] == family_n and k[1] and k[1][:1] == init and not k[1].startswith("__init__:")]
+            if full_keys:
+                key = full_keys[0]
+            else:
+                key = (family_n, f"__init__:{init}")
+        elif init and _allow_initial_merge_for_family(family_n):
+            init_key = (family_n, f"__init__:{init}")
+            if init_key in buckets and key not in buckets:
+                moved = buckets.pop(init_key)
+                buckets[key] = {'name': name, 'score': moved['score']}
         if key in buckets:
             entry = buckets[key]
             # prefer longer/more informative name
@@ -1364,17 +1733,48 @@ def clean_database(db_path: str = "papers.db", keep_days: int = 3) -> dict:
     return {"reclustered": reclustered, "deleted": deleted}
 
 
-def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.db", subscriptions_path: str | None = None, keep_days: int = 3, arxiv_max_results: int | None = None, quick: bool = False) -> None:
+def run_pipeline(
+    history_path: str = "preferences.json",
+    db_path: str = "papers.db",
+    subscriptions_path: str | None = None,
+    keep_days: int = 3,
+    arxiv_max_results: int | None = None,
+    quick: bool = False,
+    max_runtime_sec: int | None = None,
+    enable_doi_author: bool = True,
+    enable_doi_abs: bool = False,
+) -> dict[str, object]:
     t0 = time.perf_counter()
     profile = PreferenceProfile.from_history(history_path)
     store = PaperStore(db_path)
     arxiv_query, cfg_arxiv_max_results, feeds = load_subscription_config(subscriptions_path)
-    use_max = cfg_arxiv_max_results if arxiv_max_results is None else int(arxiv_max_results)
-    if quick:
-        use_max = min(use_max, 50)
-    t_fetch = time.perf_counter()
-    arxiv_keep = keep_days if quick else None
-    papers = fetch_arxiv(query=arxiv_query, max_results=use_max, keep_days=arxiv_keep) + fetch_rss_feeds(feeds=feeds, keep_days=keep_days)
+    if arxiv_max_results is None:
+        # Full mode: try to fetch all recent arXiv entries within keep_days.
+        # Quick mode still caps volume for responsiveness.
+        use_max = 1000 if not quick else min(cfg_arxiv_max_results, 50)
+    else:
+        use_max = int(arxiv_max_results)
+        if quick:
+            use_max = min(use_max, 50)
+    perf: dict[str, float | int] = {}
+    deadline = None
+    if max_runtime_sec is not None and int(max_runtime_sec) > 0:
+        deadline = t0 + int(max_runtime_sec)
+    # Always apply keep_days on arXiv fetch so returned set aligns with UI recency window.
+    arxiv_keep = keep_days
+    t_arxiv0 = time.perf_counter()
+    arxiv_papers = fetch_arxiv(query=arxiv_query, max_results=use_max, keep_days=arxiv_keep, deadline=None)
+    t_arxiv1 = time.perf_counter()
+    rss_papers = fetch_rss_feeds(
+        feeds=feeds,
+        keep_days=keep_days,
+        perf=perf,
+        deadline=deadline,
+        enable_doi_author=enable_doi_author,
+        enable_doi_abs=enable_doi_abs,
+    )
+    t_rss1 = time.perf_counter()
+    papers = arxiv_papers + rss_papers
     t_scoring = time.perf_counter()
     # Define which detected categories are considered "quantum" (keep them distinct)
     quantum_categories = {k for k in CATEGORY_RULES.keys() if ('quantum' in k) or (k in ('trapped-ion', 'quantum-platform'))}
@@ -1433,11 +1833,33 @@ def run_pipeline(history_path: str = "preferences.json", db_path: str = "papers.
         f.write(build_digest_markdown(top_rows))
     sync_to_zotero(top_rows)
     t_done = time.perf_counter()
+    doi_cutoff_triggered = bool(deadline is not None and t_done >= deadline and (enable_doi_author or enable_doi_abs))
+    timed_out = False
+    mode = "quick" if quick else "full"
+    if doi_cutoff_triggered:
+        mode = f"{mode}-doi-cutoff"
     print(
-        "[timing] fetch={:.2f}s score+upsert={:.2f}s prune+write={:.2f}s total={:.2f}s".format(
-            t_scoring - t_fetch, t_prune - t_scoring, t_done - t_prune, t_done - t0
+        "[timing] mode={} arxiv={:.2f}s rss={:.2f}s doi_author={}({:.2f}s) doi_abs={}({:.2f}s) score+upsert={:.2f}s prune+write={:.2f}s total={:.2f}s".format(
+            mode,
+            t_arxiv1 - t_arxiv0,
+            t_rss1 - t_arxiv1,
+            int(perf.get("doi_author_calls", 0)),
+            float(perf.get("doi_author_sec", 0.0)),
+            int(perf.get("doi_abs_calls", 0)),
+            float(perf.get("doi_abs_sec", 0.0)),
+            t_prune - t_scoring,
+            t_done - t_prune,
+            t_done - t0,
         )
     )
+    return {
+        "timed_out": timed_out,
+        "doi_cutoff_triggered": doi_cutoff_triggered,
+        "mode": mode,
+        "total_sec": round(t_done - t0, 2),
+        "arxiv_count": len(arxiv_papers),
+        "rss_count": len(rss_papers),
+    }
 
 
 def main() -> None:

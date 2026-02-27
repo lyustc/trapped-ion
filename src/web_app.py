@@ -6,7 +6,7 @@ import sqlite3
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone
 
-from src.lit_digest import PaperStore, generate_weekly_report, run_pipeline, load_subscription_config
+from src.lit_digest import PaperStore, generate_weekly_report, run_pipeline
 
 DISPLAY_CATEGORY_ORDER = [
     "trapped-ion",
@@ -27,6 +27,16 @@ PAGE = """
   <title>Literature Dashboard</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; background:#f7f8fa; }
+    .page-layout { display:block; }
+    .nav-toggle { position:fixed; top:12px; left:12px; z-index:1100; border:0; background:#165dff; color:#fff; padding:8px 10px; border-radius:8px; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.15); }
+    .sidebar-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.28); z-index:1040; display:none; }
+    .sidebar-backdrop.open { display:block; }
+    .sidebar { width:240px; position:fixed; left:12px; top:52px; bottom:12px; z-index:1050; overflow:auto; background:#fff; border-radius:10px; padding:12px; box-shadow:0 8px 24px rgba(0,0,0,.18); transform:translateX(-120%); transition:transform .18s ease; }
+    .sidebar.open { transform:translateX(0); }
+    .sidebar h3 { margin:0 0 8px; font-size:15px; }
+    .side-link { display:block; text-decoration:none; color:#1f2937; padding:6px 8px; border-radius:8px; margin:2px 0; }
+    .side-link:hover { background:#eef3ff; color:#165dff; }
+    .main-content { min-width:0; }
     .toolbar, .filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; align-items:center; }
     .card { margin:16px 0; background:#fff; border-radius:10px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
     button { border:0; background:#165dff; color:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; }
@@ -44,23 +54,60 @@ PAGE = """
     .score-mid { background: linear-gradient(90deg, #eab308, #f59e0b); }
     .score-low { background: linear-gradient(90deg, #ef4444, #f97316); }
     .score-text { color: #334155; font-size: 12px; }
+    @media (max-width: 980px) {
+      .sidebar { width:min(86vw, 320px); left:8px; top:48px; bottom:8px; }
+      .nav-toggle { top:8px; left:8px; padding:7px 9px; }
+    }
   </style>
 </head>
 <body>
+  <button id="navToggle" class="nav-toggle" type="button">分类</button>
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+  <div class="page-layout">
+    <aside id="sidebarNav" class="sidebar">
+      <h3>分类导航</h3>
+      {% for category in category_order %}
+      <a class="side-link" href="#cat-{{ category|replace(' ', '-') }}">{{ category }} ({{ grouped[category]|length }})</a>
+      {% endfor %}
+    </aside>
+    <main class="main-content">
   <h1>文献更新与筛选面板</h1>
   {% if message %}<div class="ok">{{ message }}</div>{% endif %}
 
   <form class="toolbar" method="post" action="/update">
     <input type="number" min="1" max="60" name="keep_days" value="{{ keep_days }}" />
     <span>仅保留近 N 天（默认 3 天）</span>
-    <label>arXiv 最大条数</label>
-    <input type="number" name="arxiv_max_results" min="1" max="500" value="{{ arxiv_max_results }}" style="width:88px" />
     <label><input type="checkbox" name="quick" value="1" /> 快速模式（仅抓最新 arXiv）</label>
+    <label><input type="checkbox" name="doi_author" value="1" {% if doi_author == "1" %}checked{% endif %}/> DOI补作者</label>
+    <label><input type="checkbox" name="doi_abs" value="1" {% if doi_abs == "1" %}checked{% endif %}/> DOI补摘要</label>
+    <label>最长等待秒数</label>
+    <input type="number" name="max_runtime_sec" min="20" max="900" value="{{ max_runtime_sec }}" style="width:88px" />
     <button type="submit">更新推荐</button>
   </form>
     <script>
         // Collapse/expand category cards and mark clicked links as read
         document.addEventListener('DOMContentLoaded', function(){
+            const navToggle = document.getElementById('navToggle');
+            const sidebar = document.getElementById('sidebarNav');
+            const backdrop = document.getElementById('sidebarBackdrop');
+            const setSidebarOpen = function(open){
+                if (!sidebar || !backdrop) return;
+                sidebar.classList.toggle('open', !!open);
+                backdrop.classList.toggle('open', !!open);
+                if (navToggle) navToggle.textContent = open ? '收起分类' : '分类';
+            };
+            if (navToggle) {
+                navToggle.addEventListener('click', function(){
+                    const isOpen = sidebar && sidebar.classList.contains('open');
+                    setSidebarOpen(!isOpen);
+                });
+            }
+            if (backdrop) {
+                backdrop.addEventListener('click', function(){ setSidebarOpen(false); });
+            }
+            document.querySelectorAll('.side-link').forEach(function(a){
+                a.addEventListener('click', function(){ setSidebarOpen(false); });
+            });
             // restore collapsed state from localStorage
             const collapsedKey = 'lit.collapsed.categories';
             let collapsed = [];
@@ -110,7 +157,7 @@ PAGE = """
     <form method="post" action="/zotero-upload" enctype="multipart/form-data">
       <label>上传 Zotero 导出文件 (JSON)</label>
       <input type="file" name="zotero_file" accept="application/json" />
-      <label>合并到当前偏好（自动更新 preferences）</label>
+      <label>覆盖当前偏好（自动更新 preferences）</label>
       <input type="checkbox" name="merge" />
       <button type="submit">处理 Zotero 导出</button>
     </form>
@@ -158,7 +205,7 @@ PAGE = """
 
     {% for category in category_order %}
         {% set items = grouped[category] %}
-        <div class="card">
+        <div class="card" id="cat-{{ category|replace(' ', '-') }}">
             <h2>{{ category }} ({{ items|length }})</h2>
             <table>
                 <thead>
@@ -189,6 +236,8 @@ PAGE = """
         </div>
     {% endfor %}
   </form>
+    </main>
+  </div>
 </body>
 </html>
 """
@@ -345,32 +394,46 @@ def create_app():
         show_arxiv = request.args.get("show_arxiv", "1")
         sort_by = request.args.get("sort_by", "score")
         keep_days = request.args.get("keep_days", os.getenv("LIT_KEEP_DAYS", "3"))
+        max_runtime_sec = request.args.get("max_runtime_sec", os.getenv("LIT_MAX_RUNTIME_SEC", "120"))
+        doi_author = request.args.get("doi_author", os.getenv("LIT_ENABLE_DOI_AUTHOR", "1"))
+        doi_abs = request.args.get("doi_abs", os.getenv("LIT_ENABLE_DOI_ABS", "0"))
         grouped, tags = _load_grouped(status, tag, show_arxiv, sort_by)
         # explicit category order to ensure `quantum-others` sits before `other`
         category_order = list(grouped.keys())
-        # provide default arXiv max from subscription config
-        _, arxiv_default_max, _ = load_subscription_config(_resolve_subscriptions_path())
-        arxiv_max_results = request.args.get("arxiv_max_results", arxiv_default_max)
-        return render_template_string(PAGE, grouped=grouped, category_order=category_order, message=request.args.get("msg", ""), tags=tags, status=status, tag=tag, show_arxiv=show_arxiv, sort_by=sort_by, keep_days=keep_days, arxiv_max_results=arxiv_max_results)
+        return render_template_string(PAGE, grouped=grouped, category_order=category_order, message=request.args.get("msg", ""), tags=tags, status=status, tag=tag, show_arxiv=show_arxiv, sort_by=sort_by, keep_days=keep_days, max_runtime_sec=max_runtime_sec, doi_author=doi_author, doi_abs=doi_abs)
 
     @app.post("/update")
     def update():
         keep_days = int(request.form.get("keep_days", os.getenv("LIT_KEEP_DAYS", "3")))
 
-        # keep dashboard simple: use configured default arXiv query; allow adjusting max results
-        arxiv_max = int(request.form.get("arxiv_max_results", 40))
         quick = request.form.get("quick", "0") == "1"
+        max_runtime_sec = int(request.form.get("max_runtime_sec", os.getenv("LIT_MAX_RUNTIME_SEC", "120")))
+        doi_author = request.form.get("doi_author", os.getenv("LIT_ENABLE_DOI_AUTHOR", "1")) == "1"
+        doi_abs = request.form.get("doi_abs", os.getenv("LIT_ENABLE_DOI_ABS", "0")) == "1"
         subs_path = _resolve_subscriptions_path()
 
-        run_pipeline(
+        result = run_pipeline(
             history_path=os.getenv("LIT_HISTORY_PATH", "preferences.json"),
             db_path=os.getenv("LIT_DB_PATH", "papers.db"),
             subscriptions_path=subs_path,
-            arxiv_max_results=arxiv_max,
             keep_days=keep_days,
             quick=quick,
+            max_runtime_sec=max_runtime_sec,
+            enable_doi_author=doi_author,
+            enable_doi_abs=doi_abs,
         )
-        return redirect(url_for("index", msg=f"更新完成，仅保留近 {keep_days} 天", keep_days=keep_days))
+        if result.get("doi_cutoff_triggered"):
+            msg = (
+                f"达到 {max_runtime_sec} 秒后已自动关闭 DOI 补全并继续抓取全文献"
+                f"（arXiv {result.get('arxiv_count', 0)} 篇，RSS {result.get('rss_count', 0)} 篇，"
+                f"总耗时 {result.get('total_sec', '?')} 秒）"
+            )
+        else:
+            msg = (
+                f"更新完成，仅保留近 {keep_days} 天（耗时 {result.get('total_sec', '?')} 秒，"
+                f"arXiv {result.get('arxiv_count', 0)} 篇，RSS {result.get('rss_count', 0)} 篇）"
+            )
+        return redirect(url_for("index", msg=msg, keep_days=keep_days, max_runtime_sec=max_runtime_sec, doi_author="1" if doi_author else "0", doi_abs="1" if doi_abs else "0"))
 
     @app.post('/zotero-upload')
     def zotero_upload():
@@ -384,17 +447,17 @@ def create_app():
             f.save(tmp.name)
             tmp.close()
             merge = bool(request.form.get('merge'))
-            # If merge checked, update preferences in place; otherwise build preview file
+            # If merge checked, overwrite preferences in place; otherwise build preview file
             out_path = 'preferences.merged.json' if not merge else os.getenv('LIT_HISTORY_PATH', 'preferences.json')
             if merge:
-                # merge into history
+                # overwrite history
                 try:
                     from src.lit_digest import update_preferences_from_zotero_export
 
                     update_preferences_from_zotero_export(tmp.name, history_path=out_path, top_k_keywords=100)
                 except Exception as e:
-                    return redirect(url_for('index', msg=f'合并失败: {e}'))
-                return redirect(url_for('index', msg=f'偏好已合并到 {out_path}'))
+                    return redirect(url_for('index', msg=f'覆盖失败: {e}'))
+                return redirect(url_for('index', msg=f'偏好已覆盖写入 {out_path}'))
             else:
                 try:
                     from src.lit_digest import build_preferences_from_zotero_export

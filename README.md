@@ -23,7 +23,9 @@
   - 支持勾选后导出为 BibTeX 文件（`.bib`），再导入 Zotero
 - 偏好支持：
   - 通过 `preferences.json` 维护关键词/作者偏好用于打分
-  - 支持导入 Zotero 导出的 JSON，并自动更新 `preferences.json`
+  - 支持导入 Zotero 导出的 JSON，并覆盖更新 `preferences.json`
+  - 关键词自动去重归一，固定保留 100 个并按 20/80 分层权重（2/1）
+  - 作者按出现次数筛选（>10 保留，>20 权重 2）
 
 ## 2. 快速开始
 
@@ -59,15 +61,15 @@ python src/web_app.py
 http://127.0.0.1:8787
 ```
 
-### 2.4 Zotero JSON 导入并自动更新 preferences
+### 2.4 Zotero JSON 导入并覆盖更新 preferences
 
 在看板页面的“从 Zotero 导入并更新偏好”模块中：
 
 1. 上传 Zotero 导出的 JSON 文件  
-2. 勾选“合并到当前偏好（自动更新 preferences）”  
-3. 提交后会自动把抽取到的作者/关键词合并到 `preferences.json`
+2. 勾选“覆盖当前偏好（自动更新 preferences）”  
+3. 提交后会自动把抽取到的作者/关键词覆盖写入 `preferences.json`
 
-如果不勾选 merge，会生成预览文件（默认 `preferences.merged.json`）供你先审阅。
+如果不勾选覆盖选项，会生成预览文件（默认 `preferences.merged.json`）供你先审阅。
 
 ## 3. 常用命令
 
@@ -156,4 +158,3 @@ pytest -q
 - `tests/`：测试
 
 ---
-
