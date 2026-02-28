@@ -43,6 +43,11 @@ PAGE = """
     .secondary { background:#4e5969; }
     table { width:100%; border-collapse: collapse; }
     th, td { padding:8px; border-bottom:1px solid #eee; vertical-align: top; text-align:left; }
+    th.col-title, td.col-title { width: 64%; }
+    th.col-select, td.col-select { width: 56px; }
+    td.col-title small { line-height: 1.35; }
+    .summary-toggle { cursor: pointer; display: inline; color:#334155; line-height: 1.35; }
+    .summary-toggle.expanded { color:#0f172a; }
     .pill { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef3ff; margin-right:4px; font-size:12px; }
     .ok { padding:10px; background:#e8ffea; border:1px solid #6ed17d; border-radius:8px; margin-bottom:10px; }
     .read { color:#1f7a1f; font-weight:600; }
@@ -57,6 +62,7 @@ PAGE = """
     @media (max-width: 980px) {
       .sidebar { width:min(86vw, 320px); left:8px; top:48px; bottom:8px; }
       .nav-toggle { top:8px; left:8px; padding:7px 9px; }
+      th.col-title, td.col-title { width:auto; }
     }
   </style>
 </head>
@@ -148,6 +154,21 @@ PAGE = """
                     }
                 });
             });
+            // click summary text to toggle full/short abstract
+            document.querySelectorAll('.summary-toggle').forEach(function(el){
+                el.addEventListener('click', function(){
+                    const full = el.dataset.full || '';
+                    const shortText = el.dataset.short || '';
+                    const expanded = el.classList.contains('expanded');
+                    if (expanded) {
+                        el.textContent = shortText;
+                        el.classList.remove('expanded');
+                    } else {
+                        el.textContent = full;
+                        el.classList.add('expanded');
+                    }
+                });
+            });
 
         });
     </script>
@@ -210,26 +231,23 @@ PAGE = """
             <h2>{{ category }} ({{ items|length }})</h2>
             <table>
                 <thead>
-                    <tr><th>选中</th><th>标题</th><th>发布时间</th><th>来源</th><th>相关度</th><th>类型/标签</th><th>阅读状态</th></tr>
+                    <tr><th class="col-select">选中</th><th class="col-title">标题</th><th class="col-date">发布时间</th><th class="col-source">来源</th><th class="col-score">相关度</th><th class="col-tags">标签</th><th class="col-status">阅读状态</th></tr>
                 </thead>
                 <tbody>
                     {% for item in items %}
                                         <tr>
-                                                <td><input type="checkbox" name="paper_ids" value="{{ item.source }}||{{ item.source_id }}" {% if item.saved %}checked{% endif %} /></td>
-                                                                                                <td><a class="external-link" data-source="{{ item.source }}" data-source-id="{{ item.source_id }}" href="{{ item.link }}" target="_blank">{{ item.title }}</a>{% if item.authors_text %}<br><small><strong>作者：</strong>{{ item.authors_text }}</small>{% endif %}<br><small>{{ item.summary|truncate(200) }}</small></td>
-                                                                                                <td>{{ item.published_at[:10] }}</td>
-                        <td>{{ item.source }}</td>
-                        <td class="score-wrap">
+                                                <td class="col-select"><input type="checkbox" name="paper_ids" value="{{ item.source }}||{{ item.source_id }}" {% if item.saved %}checked{% endif %} /></td>
+                                                                                                <td class="col-title"><a class="external-link" data-source="{{ item.source }}" data-source-id="{{ item.source_id }}" href="{{ item.link }}" target="_blank">{{ item.title }}</a>{% if item.authors_text %}<br><small><strong>作者：</strong>{{ item.authors_text }}</small>{% endif %}<br><small class="summary-toggle" data-short="{{ item.summary|truncate(200)|e }}" data-full="{{ item.summary|e }}">{{ item.summary|truncate(200) }}</small></td>
+                                                                                                <td class="col-date">{{ item.published_at[:10] }}</td>
+                        <td class="col-source">{{ item.source }}</td>
+                        <td class="score-wrap col-score">
                             <span class="score-bg">
                                 <span class="score-fill {{ item.score_level }}" style="width: {{ '%.2f'|format(item.score_pct) }}%;"></span>
                             </span>
                             <span class="score-text">{{ "%.2f"|format(item.score) }}/50</span>
                         </td>
-                        <td>
-                            <span class="pill">{{ item.article_type }}</span>
-                            {% for tag in item.tags %}<span class="pill">{{ tag }}</span>{% endfor %}
-                        </td>
-                        <td><span class="{% if item.read_status == 'read' %}read{% else %}unread{% endif %}">{{ item.read_status }}</span></td>
+                        <td class="col-tags">{% for tag in item.tags %}<span class="pill">{{ tag }}</span>{% endfor %}</td>
+                        <td class="col-status"><span class="{% if item.read_status == 'read' %}read{% else %}unread{% endif %}">{{ item.read_status }}</span></td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -333,6 +351,13 @@ def create_app():
                 tags = json.loads(tags_json or "[]")
             except Exception:
                 tags = []
+            # Hide tags that duplicate the current category label.
+            cat_norm = (category or "").strip().lower().replace("_", "-").replace(" ", "-")
+            filtered_tags = []
+            for t in tags:
+                t_norm = (str(t) or "").strip().lower().replace("_", "-").replace(" ", "-")
+                if t_norm and t_norm != cat_norm:
+                    filtered_tags.append(str(t))
             try:
                 authors = json.loads(authors_json or "[]")
                 if not isinstance(authors, list):
@@ -369,7 +394,7 @@ def create_app():
                     "score": score,
                     "score_pct": score_pct,
                     "score_level": score_level,
-                    "tags": tags,
+                    "tags": filtered_tags,
                     "article_type": article_type or "article",
                     "read_status": read_status or "unread",
                     "saved": saved.get((source, source_id), False),
