@@ -110,16 +110,18 @@ class PreferenceProfile:
     def score(self, paper: Paper) -> float:
         text = f"{paper.title} {paper.summary}".lower()
         kw_score = sum(weight for kw, weight in self.keywords.items() if kw in text)
-        author_score = 0.0
+        author_hit = False
         for author in paper.authors:
             akey = normalize_author_name(author).lower()
-            author_score += self.authors.get(akey, 0.0) * 1.5
+            if self.authors.get(akey, 0.0) > 0:
+                author_hit = True
+                break
         embed_score = cosine_similarity(self.keyword_vector, text_to_embedding(text)) * 4.0
         novelty_penalty = max(0, len(text.split()) - 800) / 400
-        # User tuning: halve keyword impact and double author impact.
-        base = 0.175 * kw_score + 0.50 * author_score + 0.40 * embed_score - novelty_penalty
-        # scale to match expected scoring range in tests
-        return round(base * 3.0, 3)
+        # Author rule: if any one preferred author appears, add a fixed +20 score (non-cumulative).
+        content_part = (0.175 * kw_score + 0.40 * embed_score - novelty_penalty) * 3.0
+        author_part = 20.0 if author_hit else 0.0
+        return round(content_part + author_part, 3)
 
 
 class PaperStore:
@@ -351,6 +353,24 @@ class PaperStore:
             pass
         # default: file-backed DB
         return sqlite3.connect(self.db_path, timeout=30)
+
+    def list_papers_for_rescore(self) -> list[tuple]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT source, source_id, title, summary, authors, link, published_at
+                FROM papers
+                """
+            ).fetchall()
+
+    def bulk_update_scores(self, updates: list[tuple[float, str, str]]) -> None:
+        if not updates:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "UPDATE papers SET score=? WHERE source=? AND source_id=?",
+                updates,
+            )
 
 
 def clean_text(text: str) -> str:
@@ -1860,6 +1880,43 @@ def run_pipeline(
         "arxiv_count": len(arxiv_papers),
         "rss_count": len(rss_papers),
     }
+
+
+def rerank_existing_papers(
+    history_path: str = "preferences.json",
+    db_path: str = "papers.db",
+) -> dict[str, object]:
+    t0 = time.perf_counter()
+    profile = PreferenceProfile.from_history(history_path)
+    store = PaperStore(db_path)
+    rows = store.list_papers_for_rescore()
+    updates: list[tuple[float, str, str]] = []
+    for source, source_id, title, summary, authors_json, link, published_at in rows:
+        try:
+            authors = json.loads(authors_json) if authors_json else []
+            if not isinstance(authors, list):
+                authors = [str(authors)]
+        except Exception:
+            authors = [authors_json] if authors_json else []
+        paper = Paper(
+            source=source or "",
+            source_id=source_id or "",
+            title=title or "",
+            summary=summary or "",
+            authors=[str(a) for a in authors if a is not None],
+            link=link or "",
+            published_at=published_at or "",
+        )
+        score = profile.score(paper)
+        updates.append((score, source, source_id))
+    store.bulk_update_scores(updates)
+    top_rows = store.top_papers(limit=200)
+    with open("digest.md", "w", encoding="utf-8") as f:
+        f.write(build_digest_markdown(top_rows))
+    sync_to_zotero(top_rows)
+    t1 = time.perf_counter()
+    print("[timing] mode=rerank-only papers={} total={:.2f}s".format(len(updates), t1 - t0))
+    return {"mode": "rerank-only", "paper_count": len(updates), "total_sec": round(t1 - t0, 2)}
 
 
 def main() -> None:

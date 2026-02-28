@@ -6,7 +6,7 @@ import sqlite3
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone
 
-from src.lit_digest import PaperStore, generate_weekly_report, run_pipeline
+from src.lit_digest import PaperStore, generate_weekly_report, rerank_existing_papers, run_pipeline
 
 DISPLAY_CATEGORY_ORDER = [
     "trapped-ion",
@@ -83,6 +83,7 @@ PAGE = """
     <label>最长等待秒数</label>
     <input type="number" name="max_runtime_sec" min="20" max="900" value="{{ max_runtime_sec }}" style="width:88px" />
     <button type="submit">更新推荐</button>
+    <button class="secondary" type="submit" formaction="/rerank">更新排序（不抓取）</button>
   </form>
     <script>
         // Collapse/expand category cards and mark clicked links as read
@@ -433,6 +434,22 @@ def create_app():
                 f"更新完成，仅保留近 {keep_days} 天（耗时 {result.get('total_sec', '?')} 秒，"
                 f"arXiv {result.get('arxiv_count', 0)} 篇，RSS {result.get('rss_count', 0)} 篇）"
             )
+        return redirect(url_for("index", msg=msg, keep_days=keep_days, max_runtime_sec=max_runtime_sec, doi_author="1" if doi_author else "0", doi_abs="1" if doi_abs else "0"))
+
+    @app.post("/rerank")
+    def rerank():
+        keep_days = int(request.form.get("keep_days", os.getenv("LIT_KEEP_DAYS", "3")))
+        max_runtime_sec = int(request.form.get("max_runtime_sec", os.getenv("LIT_MAX_RUNTIME_SEC", "120")))
+        doi_author = request.form.get("doi_author", os.getenv("LIT_ENABLE_DOI_AUTHOR", "1")) == "1"
+        doi_abs = request.form.get("doi_abs", os.getenv("LIT_ENABLE_DOI_ABS", "0")) == "1"
+        result = rerank_existing_papers(
+            history_path=os.getenv("LIT_HISTORY_PATH", "preferences.json"),
+            db_path=os.getenv("LIT_DB_PATH", "papers.db"),
+        )
+        msg = (
+            f"仅更新排序完成（重打分 {result.get('paper_count', 0)} 篇，"
+            f"耗时 {result.get('total_sec', '?')} 秒，未抓取新文章）"
+        )
         return redirect(url_for("index", msg=msg, keep_days=keep_days, max_runtime_sec=max_runtime_sec, doi_author="1" if doi_author else "0", doi_abs="1" if doi_abs else "0"))
 
     @app.post('/zotero-upload')
