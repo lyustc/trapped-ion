@@ -1872,7 +1872,7 @@ def main() -> None:
     parser.add_argument("--build-preferences-from-zotero", action="store_true", help="Build preferences from Zotero export JSON")
     parser.add_argument("--zotero-export", default="", help="Zotero export JSON file")
     parser.add_argument("--output-preferences", default="preferences.generated.json", help="Output path for generated preferences")
-    parser.add_argument("--update-preferences-from-zotero", action="store_true", help="Merge Zotero export into history")
+    parser.add_argument("--update-preferences-from-zotero", action="store_true", help="Overwrite history with Zotero-derived preferences")
     parser.add_argument("--feedback", action="store_true", help="Record feedback for an article")
     parser.add_argument("--feedback-source", default="", help="Feedback source")
     parser.add_argument("--feedback-source-id", default="", help="Feedback source_id")

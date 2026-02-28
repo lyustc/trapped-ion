@@ -7,7 +7,7 @@
 ## 1. 主要功能
 
 - 多源抓取：
-  - arXiv（可配置 query 与最大条数）
+  - arXiv（可配置 query；全量模式按时间窗口抓取，快速模式限流）
   - RSS（Nature / Science / APS 等）
 - 自动分类：
   - 重点分类 `trapped-ion`、`quantum-*`、`other`
@@ -41,7 +41,7 @@ pip install -r requirements.txt
 
 - 订阅配置：`subscriptions.json`
   - `arxiv_query`
-  - `arxiv_max_results`
+  - `arxiv_max_results`（主要用于快速模式限流）
   - `rss_feeds`
 - 偏好配置：`preferences.json`
 
@@ -73,6 +73,8 @@ http://127.0.0.1:8787
 
 ## 3. 常用命令
 
+注意这些均可以在网页端实现
+
 ### 3.1 命令行跑一次抓取/更新
 
 ```powershell
@@ -94,7 +96,8 @@ python -m src.lit_digest --weekly-report --db papers.db --report-days 7
 ### 3.4 运行测试
 
 ```powershell
-pytest -q
+pip install pytest
+python -m pytest -q
 ```
 
 ### 3.5 导出选中文献为 BibTeX
