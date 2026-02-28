@@ -82,6 +82,12 @@ class PreferenceProfile:
         self.keywords = {k.lower(): float(v) for k, v in keywords.items()}
         self.authors = {a.lower(): float(v) for a, v in authors.items()}
         self.keyword_vector = build_weighted_profile_vector(self.keywords)
+        # Build token-level keyword weights for text-coverage scoring.
+        self.keyword_token_weights: dict[str, float] = {}
+        for kw, w in self.keywords.items():
+            for tok in tokenize_text(kw):
+                self.keyword_token_weights[tok] = self.keyword_token_weights.get(tok, 0.0) + float(w)
+        self.max_keyword_token_weight = max(self.keyword_token_weights.values()) if self.keyword_token_weights else 0.0
 
     @classmethod
     def from_history(cls, history_path: str) -> "PreferenceProfile":
@@ -109,19 +115,38 @@ class PreferenceProfile:
 
     def score(self, paper: Paper) -> float:
         text = f"{paper.title} {paper.summary}".lower()
-        kw_score = sum(weight for kw, weight in self.keywords.items() if kw in text)
-        author_hit = False
+        text_tokens = set(tokenize_text(text))
+        phrase_score = sum(weight for kw, weight in self.keywords.items() if kw in text)
+        # Use a slower-rising curve to increase score dispersion.
+        phrase_strength = 1.0 - math.exp(-max(0.0, phrase_score) / 22.0)
+        phrase_part = 30.0 * (phrase_strength ** 1.8)
+        token_part = 0.0
+        if text_tokens and self.keyword_token_weights and self.max_keyword_token_weight > 0:
+            matched_weight = sum(self.keyword_token_weights.get(tok, 0.0) for tok in text_tokens)
+            # Token-level backup score for sparse/short summaries.
+            token_strength = matched_weight / max(1.0, self.max_keyword_token_weight * 18.0)
+            token_part = 30.0 * ((1.0 - math.exp(-max(0.0, token_strength))) ** 1.8)
+        keyword_part = max(phrase_part, token_part * 0.75)
+        # Reserve full keyword score for very strong matches only.
+        if phrase_score >= 70.0:
+            keyword_part = 30.0
+
+        best_author_weight = 0.0
         for author in paper.authors:
-            akey = normalize_author_name(author).lower()
-            if self.authors.get(akey, 0.0) > 0:
-                author_hit = True
-                break
-        embed_score = cosine_similarity(self.keyword_vector, text_to_embedding(text)) * 4.0
-        novelty_penalty = max(0, len(text.split()) - 800) / 400
-        # Author rule: if any one preferred author appears, add a fixed +20 score (non-cumulative).
-        content_part = (0.175 * kw_score + 0.40 * embed_score - novelty_penalty) * 3.0
-        author_part = 20.0 if author_hit else 0.0
-        return round(content_part + author_part, 3)
+            raw_key = (author or "").strip().lower()
+            norm_key = normalize_author_name(author).lower()
+            w = float(max(self.authors.get(raw_key, 0.0), self.authors.get(norm_key, 0.0)))
+            if w > best_author_weight:
+                best_author_weight = w
+
+        if best_author_weight >= 2.0:
+            author_part = 30.0
+        elif best_author_weight >= 1.0:
+            author_part = 20.0
+        else:
+            author_part = 0.0
+
+        return round(keyword_part + author_part, 3)
 
 
 class PaperStore:
