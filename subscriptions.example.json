@@ -10,6 +10,8 @@
     "science": "https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science",
     "science-advances": "https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=sciadv",
     "prl": "https://journals.aps.org/rss/recent/prl.xml",
+    "pra": "https://journals.aps.org/rss/recent/pra.xml",
+    "rmp": "https://journals.aps.org/rss/recent/rmp.xml",
     "pr-applied": "https://journals.aps.org/rss/recent/prapplied.xml",
     "prx": "https://journals.aps.org/rss/recent/prx.xml",
     "prx-quantum": "https://journals.aps.org/rss/recent/prxquantum.xml"

@@ -21,6 +21,8 @@ DEFAULT_RSS_FEEDS = {
     "nature": "https://www.nature.com/nature.rss",
     "science": "https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science",
     "prl": "https://journals.aps.org/rss/recent/prl.xml",
+    "pra": "https://journals.aps.org/rss/recent/pra.xml",
+    "rmp": "https://journals.aps.org/rss/recent/rmp.xml",
 }
 
 # Fallback when APS RSS endpoints are blocked by anti-bot pages.
